@@ -434,22 +434,7 @@ if __name__ == "__main__":
         print(bench(matmul, *xs))
 
     elif args.benchmark.startswith("quant_matmul"):
-        # Parse group_size and bits from the benchmark name, e.g.
-        # "quant_matmul_128_4" or "quant_matmul_t_128_4"
-        fn = quant_matmul[args.benchmark]
-        gs = fn.keywords["group_size"]
-        bits = fn.keywords["bits"]
-        transpose = fn.keywords["transpose"]
-
-        # xs[0] = activation x, xs[1] = original (float) weight matrix
-        # Quantize the weight internally so the caller only needs:
-        #   --size MxK --size NxK  (transpose=True)  or  --size MxK --size KxN
-        w_float = xs[1].astype(mx.float16)
-        w_q, scales, biases = mx.quantize(w_float, group_size=gs, bits=bits)
-        mx.eval(w_q, scales, biases)
-        x_input = xs[0].astype(mx.float16)
-        mx.eval(x_input)
-        print(bench(_quant_matmul, x_input, w_q, scales, biases, transpose, gs, bits))
+        print(bench(quant_matmul[args.benchmark], *xs))
 
     elif args.benchmark == "linear":
         if args.fused:
