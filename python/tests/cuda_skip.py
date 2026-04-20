@@ -1,8 +1,4 @@
 cuda_skip = {
-    # Gather matmul NYI
-    "TestBlas.test_gather_matmul",
-    "TestBlas.test_gather_matmul_grad",
-    "TestBlas.test_gather_mm_sorted_vjp",
     # Lapack ops NYI
     "TestLinalg.test_cholesky",
     "TestLinalg.test_cholesky_inv",
@@ -23,15 +19,6 @@ cuda_skip = {
     "TestQuantized.test_gather_qmm",
     "TestQuantized.test_gather_qmm_sorted",
     "TestQuantized.test_gather_qmm_grad",
-    "TestQuantized.test_non_multiples",
-    "TestQuantized.test_qmm_shapes",
-    "TestQuantized.test_fp_qvm",
-    "TestQuantized.test_qvm",
-    "TestQuantized.test_qvm_splitk",
-    "TestQuantized.test_qmv_small_non_multiples",
-    "TestQuantized.test_small_matrix",
-    "TestQuantized.test_throw",
+    # 1-bit quantization NYI on CUDA
     "TestQuantized.test_1bit_quantize_dequantize",
-    "TestQuantized.test_vjp_scales_biases",
-    "TestExportImport.test_export_quantized_model",
 }
