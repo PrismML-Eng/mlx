@@ -858,7 +858,9 @@ MTL::ComputePipelineState* get_quantized_kernel(
         metal::utils(),
         metal::gemm(),
         metal::quantized_utils(),
-        (mode == "affine") ? metal::quantized() : metal::fp_quantized(),
+        // "affine" and "affine_sym" (bias-free) both live in the affine source
+        (mode.rfind("affine", 0) == 0) ? metal::quantized()
+                                       : metal::fp_quantized(),
         template_def);
     return kernel_source;
   });

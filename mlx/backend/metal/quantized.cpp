@@ -27,7 +27,10 @@ auto get_quantized_kernel_wrapped(
     int bits,
     Args... args) {
   std::string template_def;
-  std::string fname = ((mode == "affine") ? "affine_" : "fp_") + func;
+  // "affine" -> affine_<func>; "affine_sym" (bias-free) -> affine_sym_<func>;
+  // other modes use the fp kernels.
+  std::string fname = (mode.rfind("affine", 0) == 0) ? (mode + "_" + func)
+                                                     : ("fp_" + func);
   template_def = get_template_definition(
       name, fname, type, group_size, bits, std::forward<Args>(args)...);
   return get_quantized_kernel(d, name, template_def, mode);
@@ -1281,7 +1284,9 @@ void dispatch_qmv(
     const Stream& s,
     const std::string& mode) {
   // It is a qmv with a small inner dimension so route to qmv_quad kernel
-  if ((K == 128 || (K == 64 && bits >= 2)) && is_power_of_2(bits)) {
+  // (no bias-free variant; affine_sym falls through to the plain qmv).
+  if ((K == 128 || (K == 64 && bits >= 2)) && is_power_of_2(bits) &&
+      mode != "affine_sym") {
     qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
@@ -1314,6 +1319,16 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
+  if (mode_ == QuantizationMode::Affine && !biases) {
+    // Bias-free (symmetric) affine: scales-only checkpoints; the bias is
+    // derived in-kernel. Decode path (1/2-bit qmv, transpose) only for now.
+    if (bits_ > 2 || !transpose_ || M >= vector_limit) {
+      throw std::runtime_error(
+          "[QuantizedMatmul] Bias-free affine currently supports the 1/2-bit "
+          "decode path (transpose=true, small M) only.");
+    }
+    mode = "affine_sym";
+  }
   // It is a matrix matrix product.
   if (M >= vector_limit) {
     qmm(x,

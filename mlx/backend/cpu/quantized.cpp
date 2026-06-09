@@ -943,6 +943,11 @@ void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
   encoder.set_input_array(scales);
   encoder.set_output_array(out);
   if (mode_ == QuantizationMode::Affine) {
+    if (inputs.size() < 4) {
+      throw std::runtime_error(
+          "[QuantizedMatmul::eval_cpu] Bias-free affine is Metal-only for "
+          "now; pass biases (e.g. derive_biases) on CPU.");
+    }
     auto biases = ensure_row_contiguous(inputs[3], encoder, stream());
     encoder.set_input_array(biases);
     encoder.dispatch([out = array::unsafe_weak_copy(out),
