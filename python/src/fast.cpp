@@ -119,6 +119,33 @@ void init_fast(nb::module_& parent_module) {
       parent_module.def_submodule("fast", "mlx.core.fast: fast operations");
 
   m.def(
+      "spec_decode_verify",
+      &mx::fast::spec_decode_verify,
+      "draft_tokens"_a,
+      "target_logits"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def spec_decode_verify(draft_tokens: array, target_logits: array, *, stream: Union[None, Stream, Device] = None) -> Tuple[array, array]"),
+      R"pbdoc(
+        Fused greedy speculative-decoding verify (v1).
+
+        Given the drafted tokens and the target model's logits over
+        ``[last] + draft``, returns the greedy accept result.
+
+        Args:
+            draft_tokens (array): int32 ``[B, K]`` drafted tokens.
+            target_logits (array): ``[B, K+1, V]`` target logits over the
+              ``[last] + draft`` positions.
+
+        Returns:
+            tuple(array, array): ``(n_accepted [B] int32, committed [B, K+1] int32)``
+            where ``committed[b, :n_accepted[b]]`` is the accepted draft prefix and
+            ``committed[b, n_accepted[b]]`` is the corrected (bonus) token. The
+            caller prepends the seed ``last`` token. Greedy only (temperature == 0).
+      )pbdoc");
+
+  m.def(
       "rms_norm",
       &mx::fast::rms_norm,
       "x"_a,

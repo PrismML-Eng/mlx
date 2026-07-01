@@ -955,4 +955,59 @@ bool ConvertFP8::is_equivalent(const Primitive& other) const {
   return to_fp8_ == a_other.to_fp8_;
 }
 
+std::vector<array> spec_decode_verify(
+    const array& draft_tokens,
+    const array& target_logits,
+    StreamOrDevice s_ /* = {} */) {
+  if (draft_tokens.ndim() != 2) {
+    throw std::invalid_argument(
+        "[spec_decode_verify] draft_tokens must be 2D [B, K].");
+  }
+  if (target_logits.ndim() != 3) {
+    throw std::invalid_argument(
+        "[spec_decode_verify] target_logits must be 3D [B, K+1, V].");
+  }
+  int B = draft_tokens.shape(0);
+  int K = draft_tokens.shape(1);
+  if (target_logits.shape(0) != B) {
+    throw std::invalid_argument(
+        "[spec_decode_verify] draft_tokens and target_logits batch size must match.");
+  }
+  if (target_logits.shape(1) != K + 1) {
+    throw std::invalid_argument(
+        "[spec_decode_verify] target_logits.shape[1] must equal draft_tokens.shape[1] + 1.");
+  }
+  auto s = to_stream(s_);
+
+  // Greedy target token per position: [B, K+1].
+  auto dft = astype(draft_tokens, int32, s);
+  auto tgt = astype(argmax(target_logits, -1, false, s), int32, s);
+
+  // n_accepted = first j in [0, K) where draft[:, j] != tgt[:, j], else K.
+  auto tgt_pref = slice(tgt, Shape{0, 0}, Shape{B, K}, s); // [B, K]
+  auto mism = not_equal(dft, tgt_pref, s); // [B, K]
+  auto j = broadcast_to(
+      reshape(arange(K, int32, s), Shape{1, K}, s), Shape{B, K}, s);
+  auto cand = where(mism, j, full(Shape{B, K}, K, int32, s), s);
+  auto n_acc = min(cand, /*axis=*/1, /*keepdims=*/false, s); // [B]
+
+  // Corrected (bonus) token at position n_accepted.
+  auto n_acc2 = reshape(n_acc, Shape{B, 1}, s);
+  auto corrected = take_along_axis(tgt, n_acc2, /*axis=*/1, s); // [B, 1]
+
+  // committed[:, j] = draft for j < n_acc, corrected at j == n_acc, else 0.
+  auto j1 = broadcast_to(
+      reshape(arange(K + 1, int32, s), Shape{1, K + 1}, s), Shape{B, K + 1}, s);
+  auto nacc_b = broadcast_to(n_acc2, Shape{B, K + 1}, s);
+  auto dft_ext = concatenate({dft, zeros(Shape{B, 1}, int32, s)}, /*axis=*/1, s);
+  auto corr_b = broadcast_to(corrected, Shape{B, K + 1}, s);
+  auto committed = where(
+      less(j1, nacc_b, s),
+      dft_ext,
+      where(equal(j1, nacc_b, s), corr_b, zeros(Shape{B, K + 1}, int32, s), s),
+      s); // [B, K+1]
+
+  return {n_acc, committed};
+}
+
 } // namespace mlx::core::fast
