@@ -46,6 +46,11 @@ bool fast::ScaledDotProductAttentionVJP::use_fallback(
   return true;
 }
 
+bool fast::SpecDecodeVerify::use_fallback(Stream s) {
+  return true;
+}
+NO_GPU_MULTI(fast::SpecDecodeVerify)
+
 NO_GPU(Abs)
 NO_GPU(Add)
 NO_GPU(AddMM)
