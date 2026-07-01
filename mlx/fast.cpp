@@ -979,35 +979,65 @@ std::vector<array> spec_decode_verify(
   }
   auto s = to_stream(s_);
 
-  // Greedy target token per position: [B, K+1].
+  // Reuse mlx's fast argmax on-device (result stays on the GPU); the fused
+  // primitive does only the tiny per-row prefix-match. Primitive inputs are
+  // int32 token arrays, so the kernel needs no large-V reduction.
   auto dft = astype(draft_tokens, int32, s);
-  auto tgt = astype(argmax(target_logits, -1, false, s), int32, s);
+  auto tgt = astype(argmax(target_logits, -1, false, s), int32, s); // [B, K+1]
 
-  // n_accepted = first j in [0, K) where draft[:, j] != tgt[:, j], else K.
-  auto tgt_pref = slice(tgt, Shape{0, 0}, Shape{B, K}, s); // [B, K]
-  auto mism = not_equal(dft, tgt_pref, s); // [B, K]
-  auto j = broadcast_to(
-      reshape(arange(K, int32, s), Shape{1, K}, s), Shape{B, K}, s);
-  auto cand = where(mism, j, full(Shape{B, K}, K, int32, s), s);
-  auto n_acc = min(cand, /*axis=*/1, /*keepdims=*/false, s); // [B]
+  // Fallback (CPU path + autodiff): the same verify as a plain op composition,
+  // operating on (draft_tokens, target_tokens). This is the correctness oracle
+  // the Metal kernel is checked against.
+  auto fallback =
+      [B, K, s](const std::vector<array>& inputs) -> std::vector<array> {
+    auto d = inputs[0]; // [B, K] int32
+    auto t = inputs[1]; // [B, K+1] int32
+    auto t_pref = slice(t, Shape{0, 0}, Shape{B, K}, s);
+    auto mism = not_equal(d, t_pref, s);
+    auto j = broadcast_to(
+        reshape(arange(K, int32, s), Shape{1, K}, s), Shape{B, K}, s);
+    auto n_acc = min(
+        where(mism, j, full(Shape{B, K}, K, int32, s), s),
+        /*axis=*/1,
+        /*keepdims=*/false,
+        s); // [B]
+    auto n_acc2 = reshape(n_acc, Shape{B, 1}, s);
+    auto corrected = take_along_axis(t, n_acc2, /*axis=*/1, s); // [B, 1]
+    auto j1 = broadcast_to(
+        reshape(arange(K + 1, int32, s), Shape{1, K + 1}, s),
+        Shape{B, K + 1},
+        s);
+    auto nacc_b = broadcast_to(n_acc2, Shape{B, K + 1}, s);
+    auto d_ext = concatenate({d, zeros(Shape{B, 1}, int32, s)}, /*axis=*/1, s);
+    auto corr_b = broadcast_to(corrected, Shape{B, K + 1}, s);
+    auto committed = where(
+        less(j1, nacc_b, s),
+        d_ext,
+        where(equal(j1, nacc_b, s), corr_b, zeros(Shape{B, K + 1}, int32, s), s),
+        s);
+    return {n_acc, committed};
+  };
 
-  // Corrected (bonus) token at position n_accepted.
-  auto n_acc2 = reshape(n_acc, Shape{B, 1}, s);
-  auto corrected = take_along_axis(tgt, n_acc2, /*axis=*/1, s); // [B, 1]
+  std::vector<array> prim_inputs = {dft, tgt};
+  if (SpecDecodeVerify::use_fallback(s)) {
+    return fallback(prim_inputs);
+  }
+  return array::make_arrays(
+      {Shape{B}, Shape{B, K + 1}},
+      {int32, int32},
+      std::make_shared<SpecDecodeVerify>(s, fallback),
+      prim_inputs);
+}
 
-  // committed[:, j] = draft for j < n_acc, corrected at j == n_acc, else 0.
-  auto j1 = broadcast_to(
-      reshape(arange(K + 1, int32, s), Shape{1, K + 1}, s), Shape{B, K + 1}, s);
-  auto nacc_b = broadcast_to(n_acc2, Shape{B, K + 1}, s);
-  auto dft_ext = concatenate({dft, zeros(Shape{B, 1}, int32, s)}, /*axis=*/1, s);
-  auto corr_b = broadcast_to(corrected, Shape{B, K + 1}, s);
-  auto committed = where(
-      less(j1, nacc_b, s),
-      dft_ext,
-      where(equal(j1, nacc_b, s), corr_b, zeros(Shape{B, K + 1}, int32, s), s),
-      s); // [B, K+1]
+bool SpecDecodeVerify::is_equivalent(const Primitive&) const {
+  return true; // no parameters
+}
 
-  return {n_acc, committed};
+std::vector<Shape> SpecDecodeVerify::output_shapes(
+    const std::vector<array>& inputs) {
+  int B = inputs[0].shape(0);
+  int K = inputs[0].shape(1);
+  return {Shape{B}, Shape{B, K + 1}};
 }
 
 } // namespace mlx::core::fast

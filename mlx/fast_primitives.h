@@ -429,4 +429,34 @@ class CustomKernel : public Primitive {
   CompileOptions::Data compile_options_;
 };
 
+// Fused greedy speculative-decoding verify. Inputs: draft_tokens int32 [B, K]
+// and target_tokens int32 [B, K+1] (the target argmax). Outputs: n_accepted
+// [B] int32 and committed [B, K+1] int32. The op-level fallback (a plain
+// composition) runs on CPU and for autodiff; the Metal eval_gpu runs a trivial
+// per-row prefix-match kernel.
+class SpecDecodeVerify : public Custom {
+ public:
+  SpecDecodeVerify(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback)
+      : Custom(stream, std::move(fallback)) {}
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error(
+        "[SpecDecodeVerify] no eval_cpu; CPU uses the op fallback.");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(SpecDecodeVerify);
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+  auto state() const {
+    return std::make_tuple(nullptr);
+  }
+};
+
 } // namespace mlx::core::fast
