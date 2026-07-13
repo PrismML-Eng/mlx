@@ -12,5 +12,6 @@ Fast
   layer_norm
   rope
   scaled_dot_product_attention
+  spec_decode_verify
   metal_kernel
   cuda_kernel

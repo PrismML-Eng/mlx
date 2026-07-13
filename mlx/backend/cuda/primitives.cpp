@@ -32,6 +32,7 @@ NO_GPU(Inverse)
 NO_GPU(Cholesky)
 NO_GPU_MULTI(Eig)
 NO_GPU_MULTI(Eigh)
+NO_GPU_USE_FALLBACK(fast::SpecDecodeVerify)
 
 namespace distributed {
 NO_GPU_MULTI(Send)
