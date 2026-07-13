@@ -588,7 +588,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
 
         # Affine: every bit-width and group size.
         for group_size, bits, K in product(
-            [32, 64, 128], [2, 3, 4, 5, 6, 8], [128, 512]
+            [32, 64, 128], [1, 2, 3, 4, 5, 6, 8], [128, 512]
         ):
             for M, N, B in product(Ms, Ns, Bs):
                 with self.subTest(M=M, N=N, K=K, B=B, group_size=group_size, bits=bits):
@@ -622,7 +622,12 @@ class TestQuantized(mlx_tests.MLXTestCase):
 
         # Tiny shapes (M, K, N): small K and non-multiple output rows.
         tiny = [(2, 32, 10), (4, 32, 7), (3, 64, 5), (5, 64, 3)]
-        settings = [(4, 32, "affine"), (6, 32, "affine"), (4, 16, "nvfp4")]
+        settings = [
+            (1, 32, "affine"),
+            (4, 32, "affine"),
+            (6, 32, "affine"),
+            (4, 16, "nvfp4"),
+        ]
         for M, K, N in tiny:
             for bits, group_size, mode in settings:
                 with self.subTest(

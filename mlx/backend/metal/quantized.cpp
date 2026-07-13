@@ -296,8 +296,18 @@ void qmv(
 }
 
 // affine qmv_wide only beats qmv on gen-15+; fp benefits on every gen.
-inline bool use_qmv_wide(const std::string& mode, metal::Device& d) {
-  return mode != "affine" || d.get_architecture_gen() >= 15;
+// The 1-bit path has so little weight traffic that unpacking into registers
+// dominates even when several input rows reuse the result. The 2-bit path
+// breaks even after two rows and wins once three or more rows share a block.
+inline bool
+use_qmv_wide(const std::string& mode, int bits, int M, metal::Device& d) {
+  if (mode != "affine") {
+    return true;
+  }
+  if (bits == 1 || (bits == 2 && M < 3)) {
+    return false;
+  }
+  return d.get_architecture_gen() >= 15;
 }
 
 // Dispatches qmv_wide (fp modes -> fp_qmv_wide, affine -> affine_qmv_wide):
@@ -1480,7 +1490,7 @@ void dispatch_qmv(
 
   // Small batch so route to qmv_wide, which reuses each weight group across the
   // M vectors.
-  if (M >= 2 && use_qmv_wide(mode, d)) {
+  if (M >= 2 && use_qmv_wide(mode, bits, M, d)) {
     qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
