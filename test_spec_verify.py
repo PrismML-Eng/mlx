@@ -7,6 +7,7 @@ On a Metal build this exercises BOTH paths:
 Both must match the oracle. Run from the worktree root with the venv python:
     .venv/bin/python test_spec_verify.py
 """
+import random
 import sys
 import mlx.core as mx
 
@@ -67,6 +68,34 @@ def run():
                     print(f"  [FAIL] {path_name} {str(dt):>16} {name}: "
                           f"got n={n} c={got_c}  exp n={exp_n} c={exp_c}")
         print(f"  [{'OK ' if allok else 'FAIL'}] path={path_name}: all cases x fp32/fp16/bf16")
+
+    # Exercise prefix lengths, batch shapes, and corrected-token positions that
+    # are awkward to enumerate by hand. One-hot logits make the expected greedy
+    # target token unambiguous while still driving the same argmax reduction.
+    rng = random.Random(7)
+    for _ in range(40):
+        b, k, v = rng.randint(1, 4), rng.randint(1, 8), rng.randint(8, 96)
+        target = [[rng.randrange(v) for _ in range(k + 1)] for _ in range(b)]
+        draft = []
+        for row in target:
+            draft.append([
+                row[j] if rng.random() < 0.5 else (row[j] + rng.randrange(1, v)) % v
+                for j in range(k)
+            ])
+        exp_n, exp_c = oracle(draft, target)
+        n, c = mx.fast.spec_decode_verify(
+            mx.array(draft, dtype=mx.int32), onehot_logits(target, v, mx.float16)
+        )
+        mx.eval(n, c)
+        got_n, got_c = n.tolist(), c.tolist()
+        got_c = [got_c[i][: exp_n[i] + 1] for i in range(b)]
+        if got_n != exp_n or got_c != exp_c:
+            allok = False
+            print(f"  [FAIL] randomized b={b} k={k} v={v}: got n={got_n} c={got_c} "
+                  f"exp n={exp_n} c={exp_c}")
+            break
+    else:
+        print("  [OK ] randomized GPU oracle sweep (40 cases)")
 
     try:
         mx.fast.spec_decode_verify(mx.zeros((1, 3), dtype=mx.int32), mx.zeros((1, 3, 8)))
