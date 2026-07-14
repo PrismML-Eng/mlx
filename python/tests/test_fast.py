@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import math
+import random
 import unittest
 
 import mlx.core as mx
@@ -988,6 +989,89 @@ class TestFast(mlx_tests.MLXTestCase):
         """
         out = call_kernel(a, source)
         self.assertTrue(mx.array_equal(out, mx.ones_like(out)))
+
+    def test_spec_decode_verify(self):
+        # Validate mx.fast.spec_decode_verify against a pure-Python oracle that
+        # mirrors the greedy verify loop. On a Metal build the default device
+        # exercises the fused kernel and stream=mx.cpu the op-composition
+        # fallback; both must agree with the oracle.
+        def oracle(draft, tgt_tokens):
+            B, K = len(draft), len(draft[0])
+            n_acc, committed = [], []
+            for b in range(B):
+                na = K
+                for j in range(K):
+                    if draft[b][j] != tgt_tokens[b][j]:
+                        na = j
+                        break
+                n_acc.append(na)
+                committed.append(draft[b][:na] + [tgt_tokens[b][na]])
+            return n_acc, committed
+
+        # One-hot logits make the greedy argmax token unambiguous while still
+        # driving the same large-V reduction the real caller feeds in.
+        def onehot_logits(tgt_tokens, V, dtype):
+            B, L = len(tgt_tokens), len(tgt_tokens[0])
+            lg = [[[-10.0] * V for _ in range(L)] for _ in range(B)]
+            for b in range(B):
+                for j in range(L):
+                    lg[b][j][tgt_tokens[b][j]] = 10.0
+            return mx.array(lg).astype(dtype)
+
+        def check(draft, tgt_tokens, V, dtype, stream):
+            exp_n, exp_c = oracle(draft, tgt_tokens)
+            lg = onehot_logits(tgt_tokens, V, dtype)
+            kw = {"stream": stream} if stream is not None else {}
+            n, c = mx.fast.spec_decode_verify(
+                mx.array(draft, dtype=mx.int32), lg, **kw
+            )
+            mx.eval(n, c)
+            n, c = n.tolist(), c.tolist()
+            got_c = [c[b][: exp_n[b] + 1] for b in range(len(draft))]
+            self.assertEqual(n, exp_n)
+            self.assertEqual(got_c, exp_c)
+
+        cases = [
+            ("full-accept", [[5, 6, 7]], [[5, 6, 7, 9]]),
+            ("mismatch@2", [[5, 6, 7]], [[5, 6, 1, 9]]),
+            ("reject-all", [[5, 6, 7]], [[2, 6, 7, 9]]),
+            ("K=1", [[3]], [[3, 4]]),
+            (
+                "batch2-K4",
+                [[1, 2, 3, 4], [1, 2, 3, 4]],
+                [[1, 2, 9, 4, 7], [1, 2, 3, 4, 8]],
+            ),
+            ("batch3-K1", [[7], [7], [7]], [[7, 1], [2, 3], [7, 9]]),
+        ]
+        # stream=None is the default device (fused kernel on Metal); mx.cpu is
+        # the op-composition fallback.
+        for path, stream in (("default", None), ("cpu-fallback", mx.cpu)):
+            for dtype in (mx.float32, mx.float16, mx.bfloat16):
+                for name, draft, tgt in cases:
+                    with self.subTest(path=path, dtype=str(dtype), case=name):
+                        check(draft, tgt, 32, dtype, stream)
+
+        # Randomized sweep over prefix lengths, batch shapes, and corrected-token
+        # positions that are awkward to enumerate by hand.
+        rng = random.Random(7)
+        for i in range(40):
+            b, k, v = rng.randint(1, 4), rng.randint(1, 8), rng.randint(8, 96)
+            target = [[rng.randrange(v) for _ in range(k + 1)] for _ in range(b)]
+            draft = [
+                [
+                    row[j] if rng.random() < 0.5 else (row[j] + rng.randrange(1, v)) % v
+                    for j in range(k)
+                ]
+                for row in target
+            ]
+            with self.subTest(sweep=i, b=b, k=k, v=v):
+                check(draft, target, v, mx.float16, None)
+
+        # target_logits.shape[1] must equal draft.shape[1] + 1.
+        with self.assertRaises(ValueError):
+            mx.fast.spec_decode_verify(
+                mx.zeros((1, 3), dtype=mx.int32), mx.zeros((1, 3, 8))
+            )
 
 
 if __name__ == "__main__":
