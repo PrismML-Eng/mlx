@@ -299,6 +299,7 @@ void qmv(
 // The 1-bit path has so little weight traffic that unpacking into registers
 // dominates even when several input rows reuse the result. The 2-bit path
 // breaks even after two rows and wins once three or more rows share a block.
+// (1-bit small-M is handled by qmv_sel_f16 before this is consulted.)
 inline bool
 use_qmv_wide(const std::string& mode, int bits, int M, metal::Device& d) {
   if (mode != "affine") {
@@ -308,6 +309,108 @@ use_qmv_wide(const std::string& mode, int bits, int M, metal::Device& d) {
     return false;
   }
   return d.get_architecture_gen() >= 15;
+}
+
+// True when the shared-decode sel_f16 qmv handles this matmul: 1-bit affine
+// with several input rows and qmv_fast-aligned shapes. It streams the weights
+// once per row tile (vs once per row), decoding each packed word ONCE in
+// half precision and sharing it across the tile's per-row half-fma
+// accumulators (fp32 promotion per 1024-k block). qmv_wide's generic
+// 8-value dequant->scalar-FMA decode is ALU-bound at 1 bit (measured worse
+// than M x per-row qmv), so 1-bit never routes there. M == 1 keeps the
+// per-row qmv path: sel_f16 is parity there and the M=1 decode hot path
+// must stay bit-identical.
+//
+// Restricted to half/bfloat activations: the half accumulation is a lossy
+// tradeoff (~2x the shipping path's quant error, gated downstream by
+// logit-KLD) that only makes sense where the caller already accepted
+// half-level precision. An fp32 caller keeps the precise per-row qmv, whose
+// fp32 accumulation is ~400x tighter and which is not a decode hot path.
+inline bool use_qmv_sel_f16(
+    const std::string& mode,
+    int bits,
+    int M,
+    int N,
+    int K,
+    Dtype dtype) {
+  return mode == "affine" && bits == 1 && M >= 2 && N % 8 == 0 &&
+      K % 512 == 0 && (dtype == float16 || dtype == bfloat16);
+}
+
+// Shared-decode sel_f16 qmv: vecs_per_tg input rows share each streamed and
+// half-decoded weight chunk. Grid mirrors qmv (2 simdgroups x 4 output rows
+// per threadgroup); tiles along M use the fewest tiles, then the smallest
+// tile that covers M.
+void qmv_sel_f16(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    const std::string& mode) {
+  // Register pressure (num_vecs x 32 half activations per lane at 1 bit)
+  // caps the tile at 4 rows.
+  constexpr int max_vecs_per_tg = 4;
+  int n_tiles = (M + max_vecs_per_tg - 1) / max_vecs_per_tg;
+  int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
+
+  int B = out.size() / M / N;
+
+  int bn = 8;
+  int bk = 32;
+  MTL::Size group_dims(bk, 2, 1);
+  MTL::Size grid_dims(n_tiles, (N + bn - 1) / bn, B);
+
+  std::string kname;
+  kname.reserve(64);
+  std::string type_string = get_type_string(x.dtype());
+
+  concatenate(
+      kname,
+      mode + "_qmv_sel_f16_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_nv_",
+      vecs_per_tg,
+      B > 1 ? "_batch_1" : "_batch_0");
+  auto kernel = get_quantized_kernel_wrapped(
+      d,
+      kname,
+      "qmv_sel_f16",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      vecs_per_tg,
+      B > 1);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  if (biases) {
+    compute_encoder.set_input_array(*biases, c++);
+  }
+  compute_encoder.set_input_array(x, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.set_bytes(M, c++);
+  add_strides_and_shapes(compute_encoder, B <= 1, x, w, scales, biases, c);
+
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
 // Dispatches qmv_wide (fp modes -> fp_qmv_wide, affine -> affine_qmv_wide):
@@ -1479,6 +1582,15 @@ void dispatch_qmv(
   // It is a qmv with a small inner dimension so route to qmv_quad kernel
   if ((K == 128 || (K == 64 && bits >= 2)) && is_power_of_2(bits)) {
     qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+    return;
+  }
+
+  // 1-bit small batch (2 <= M < vector_limit): share each streamed weight
+  // chunk across the M rows, decoded once in half (qmv_wide's generic decode
+  // is ALU-bound at 1 bit; per-row qmv re-reads the weights M times).
+  if (use_qmv_sel_f16(mode, bits, M, N, K, x.dtype())) {
+    qmv_sel_f16(
+        x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
 

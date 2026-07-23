@@ -931,6 +931,165 @@ METAL_FUNC void qmv_fast_impl(
   }
 }
 
+// Shared-decode select+FMA 1-bit qmv (sel_f16): one threadgroup covers
+// num_vecs input rows, so each packed weight word is streamed and decoded
+// ONCE per row tile instead of once per row (the per-row qmv re-reads the
+// full weight matrix M times). Same thread layout as qmv_fast (2 simdgroups
+// x 4 output rows, per-lane 32 consecutive k per 1024-k block). The decode
+// is a half-precision select (w = bit ? scale + bias : bias) from the packed
+// uint32 weight word, shared by the num_vecs per-row accumulators; per-row
+// accumulation runs in half fma with an fp32 promotion once per 1024-k
+// block. The half staging is load-bearing, not a nicety: the same tile with
+// fp32 decode + fp32 accumulators is register-bound (lm_head M=3 measured
+// 7.0x the DRAM floor vs 2.08x for this form).
+//
+// Numerics note: per-row results are NOT bit-identical to qmv_fast, and are
+// looser than the fp32 dequantize-then-FMA form: half products accumulate
+// over 32 values between fp32 promotions (measured max|err| ~0.7 at K=5120
+// vs ~0.3 for the per-row path, against an fp32-dequant reference). Ship
+// decisions for this path gate on measured logit-KLD, not on this bound.
+template <typename T, int group_size, int bits, int num_vecs>
+METAL_FUNC void qmv_sel_f16_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& M,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int packs_per_thread = bits <= 2 ? 1 : 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  static_assert(bits == 1, "qmv_sel_f16 is a 1-bit-only kernel");
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+
+  typedef float U;
+
+  // Half staging throughout the shared-decode core: activations are cast to
+  // half on load, decoded weights live as half, and the inner loop is a
+  // native half fma. fp32 appears only in the per-block promotion and the
+  // final simd reduction.
+  thread half x_thread[num_vecs][values_per_thread];
+  thread half w_dq[values_per_thread];
+  thread U result[results_per_simdgroup][num_vecs] = {{0}};
+
+  // Adjust positions
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  const int vec0 = tid.x * num_vecs;
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+
+  // Rows past M re-read row M-1 (guarded at the write).
+  const device T* xv[num_vecs];
+#pragma clang loop unroll(full)
+  for (int v = 0; v < num_vecs; v++) {
+    xv[v] = x + min(vec0 + v, M - 1) * in_vec_size +
+        simd_lid * values_per_thread;
+  }
+
+  const int aligned_end = (in_vec_size / block_size) * block_size;
+
+  for (int k = 0; k < aligned_end; k += block_size) {
+#pragma clang loop unroll(full)
+    for (int v = 0; v < num_vecs; v++) {
+      for (int i = 0; i < values_per_thread; i++) {
+        x_thread[v][i] = static_cast<half>(xv[v][i]);
+      }
+    }
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl = (const device uint32_t*)(ws + row * in_vec_size_w);
+      const half lo = static_cast<half>(biases[row * in_vec_size_g]);
+      const half hi = static_cast<half>(scales[row * in_vec_size_g]) + lo;
+
+      // At 1 bit one packed word is the lane's whole 32-value chunk; decode
+      // it once in half, shared by all num_vecs rows.
+      uint32_t wword = wl[0];
+#pragma clang loop unroll(full)
+      for (int i = 0; i < values_per_thread; i++) {
+        w_dq[i] = select(lo, hi, bool(wword & (1u << i)));
+      }
+
+#pragma clang loop unroll(full)
+      for (int v = 0; v < num_vecs; v++) {
+        half hacc = 0;
+        for (int i = 0; i < values_per_thread; i++) {
+          hacc = fma(x_thread[v][i], w_dq[i], hacc);
+        }
+        result[row][v] += static_cast<U>(hacc);
+      }
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+#pragma clang loop unroll(full)
+    for (int v = 0; v < num_vecs; v++) {
+      xv[v] += block_size;
+    }
+  }
+
+  if (aligned_end < in_vec_size) {
+    bool in_bounds = (aligned_end + simd_lid * values_per_thread) < in_vec_size;
+    if (in_bounds) {
+#pragma clang loop unroll(full)
+      for (int v = 0; v < num_vecs; v++) {
+        for (int i = 0; i < values_per_thread; i++) {
+          x_thread[v][i] = static_cast<half>(xv[v][i]);
+        }
+      }
+
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        auto wl = (const device uint32_t*)(ws + row * in_vec_size_w);
+        const half lo = static_cast<half>(biases[row * in_vec_size_g]);
+        const half hi = static_cast<half>(scales[row * in_vec_size_g]) + lo;
+
+        uint32_t wword = wl[0];
+#pragma clang loop unroll(full)
+        for (int i = 0; i < values_per_thread; i++) {
+          w_dq[i] = select(lo, hi, bool(wword & (1u << i)));
+        }
+
+#pragma clang loop unroll(full)
+        for (int v = 0; v < num_vecs; v++) {
+          half hacc = 0;
+          for (int i = 0; i < values_per_thread; i++) {
+            hacc = fma(x_thread[v][i], w_dq[i], hacc);
+          }
+          result[row][v] += static_cast<U>(hacc);
+        }
+      }
+    }
+  }
+
+  y += out_row;
+  for (int row = 0; row < results_per_simdgroup; row++) {
+#pragma clang loop unroll(full)
+    for (int v = 0; v < num_vecs; v++) {
+      U r = simd_sum(result[row][v]);
+      if (simd_lid == 0 && vec0 + v < M) {
+        y[(vec0 + v) * out_vec_size + row] = static_cast<T>(r);
+      }
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
@@ -1754,6 +1913,59 @@ template <typename T, int group_size, int bits, bool batched>
       y,
       in_vec_size,
       out_vec_size,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+template <typename T, int group_size, int bits, int num_vecs, bool batched>
+[[kernel]] void affine_qmv_sel_f16(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    const constant int& x_batch_ndims [[buffer(8)]],
+    const constant int* x_shape [[buffer(9)]],
+    const constant int64_t* x_strides [[buffer(10)]],
+    const constant int& w_batch_ndims [[buffer(11)]],
+    const constant int* w_shape [[buffer(12)]],
+    const constant int64_t* w_strides [[buffer(13)]],
+    const constant int64_t* s_strides [[buffer(14)]],
+    const constant int64_t* b_strides [[buffer(15)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if (batched) {
+    adjust_matrix_offsets<T>(
+        x,
+        w,
+        scales,
+        biases,
+        y,
+        out_vec_size * M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        s_strides,
+        b_strides,
+        tid);
+  }
+  qmv_sel_f16_impl<T, group_size, bits, num_vecs>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      in_vec_size,
+      out_vec_size,
+      M,
       tid,
       simd_gid,
       simd_lid);

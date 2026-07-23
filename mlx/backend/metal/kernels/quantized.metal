@@ -63,6 +63,16 @@
       k_lanes,                                                      \
       batched)
 
+#define instantiate_quantized_sel_f16(name, type, group_size, bits, vecs_per_tg, batched)     \
+  instantiate_kernel(                                                                          \
+      #name "_" #type "_gs_" #group_size "_b_" #bits "_nv_" #vecs_per_tg "_batch_" #batched,   \
+      name,                                                         \
+      type,                                                         \
+      group_size,                                                   \
+      bits,                                                         \
+      vecs_per_tg,                                                  \
+      batched)
+
 #define instantiate_quantized_split_k(name, type, group_size, bits, split_k)     \
   instantiate_kernel(                                                            \
       #name "_" #type "_gs_" #group_size "_b_" #bits "_spk_" #split_k, \
@@ -130,6 +140,17 @@
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 4, 8) \
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 5, 8)
 
+// sel_f16 (shared-decode select+FMA qmv) is only routed for 1-bit affine
+// (vecs_per_tg 2..4); other widths keep qmv_wide.
+#define instantiate_quantized_sel_f16_wrap(name, type, group_size, bits, vecs_per_tg) \
+  instantiate_quantized_sel_f16(name, type, group_size, bits, vecs_per_tg, 0)         \
+  instantiate_quantized_sel_f16(name, type, group_size, bits, vecs_per_tg, 1)
+
+#define instantiate_quantized_all_sel_f16_1bit(type, group_size) \
+  instantiate_quantized_sel_f16_wrap(affine_qmv_sel_f16, type, group_size, 1, 2) \
+  instantiate_quantized_sel_f16_wrap(affine_qmv_sel_f16, type, group_size, 1, 3) \
+  instantiate_quantized_sel_f16_wrap(affine_qmv_sel_f16, type, group_size, 1, 4)
+
 #define instantiate_quantized_all_splitk(type, group_size, bits)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 8)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 32)  \
@@ -180,4 +201,15 @@
   instantiate_quantized_groups(6) \
   instantiate_quantized_groups(8)
 
-instantiate_quantized_all() // clang-format on
+#define instantiate_quantized_sel_f16_types(group_size)            \
+  instantiate_quantized_all_sel_f16_1bit(float, group_size)        \
+  instantiate_quantized_all_sel_f16_1bit(float16_t, group_size)    \
+  instantiate_quantized_all_sel_f16_1bit(bfloat16_t, group_size)
+
+#define instantiate_quantized_sel_f16_all() \
+  instantiate_quantized_sel_f16_types(128)  \
+  instantiate_quantized_sel_f16_types(64)   \
+  instantiate_quantized_sel_f16_types(32)
+
+instantiate_quantized_all()
+instantiate_quantized_sel_f16_all() // clang-format on
