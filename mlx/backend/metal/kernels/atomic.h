@@ -159,7 +159,7 @@ union uint_or_packed {
 
 template <typename T, typename Op>
 struct mlx_atomic_update_helper {
-  uint operator()(uint_or_packed<T> init, T update, size_t elem_offset) {
+  uint operator()(uint_or_packed<T> init, T update, size_t elem_offset) thread {
     Op op;
     init.val[elem_offset] = op(update, init.val[elem_offset]);
     return init.bits;
@@ -196,7 +196,7 @@ struct __None {
     return true;
   }
 
-  T operator()(T a, T b) {
+  T operator()(T a, T b) thread {
 #pragma unused(b)
     return a;
   }
@@ -210,7 +210,7 @@ struct __Add {
     return true;
   }
 
-  T operator()(T a, T b) {
+  T operator()(T a, T b) thread {
     return a + b;
   }
 };
@@ -222,7 +222,7 @@ struct __Mul {
     return b != 0;
   }
 
-  T operator()(T a, T b) {
+  T operator()(T a, T b) thread {
     return a * b;
   }
 };
@@ -233,7 +233,7 @@ struct __Max {
     return a > b;
   }
 
-  T operator()(T a, T b) {
+  T operator()(T a, T b) thread {
     return max(a, b);
   }
 };
@@ -244,7 +244,7 @@ struct __Min {
     return a < b;
   }
 
-  T operator()(T a, T b) {
+  T operator()(T a, T b) thread {
     return min(a, b);
   }
 };
