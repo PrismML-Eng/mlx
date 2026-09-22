@@ -230,7 +230,8 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (size_of(out.dtype()) == 8) {
+  if (size_of(out.dtype()) == 8 &&
+      !(out.dtype() == complex64 && reduce_type_ == Scatter::Sum)) {
     std::ostringstream msg;
     msg << "[Scatter::eval_gpu] Does not support " << out.dtype();
     throw std::invalid_argument(msg.str());
@@ -519,6 +520,13 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (size_of(out.dtype()) == 8 &&
+      !(out.dtype() == complex64 && reduce_type_ == ScatterAxis::Sum)) {
+    std::ostringstream msg;
+    msg << "[ScatterAxis::eval_gpu] Does not support " << out.dtype();
+    throw std::invalid_argument(msg.str());
+  }
+
   auto& src = inputs[0];
   auto& idx = inputs[1];
   auto& upd = inputs[2];

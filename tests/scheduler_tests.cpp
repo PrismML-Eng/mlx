@@ -48,8 +48,11 @@ TEST_CASE("test default stream in threads") {
   for (size_t i = 0; i < num_threads; ++i) {
     threads.emplace_back([&thread_streams, &mtx]() {
       auto s = default_stream(gpu::is_available() ? Device::gpu : Device::cpu);
-      std::lock_guard lock(mtx);
-      thread_streams.insert(s);
+      {
+        std::lock_guard lock(mtx);
+        thread_streams.insert(s);
+      }
+      clear_streams();
     });
   }
 
@@ -65,7 +68,77 @@ TEST_CASE("test default stream in threads") {
   CHECK_EQ(new_streams, thread_streams);
 }
 
+TEST_CASE("test access stream in other thread") {
+  auto main_thread_stream = new_stream(default_device());
+  eval(arange(10, main_thread_stream));
+
+  bool error_caught = false;
+  std::thread t([&] {
+    try {
+      eval(arange(10, main_thread_stream));
+    } catch (const std::runtime_error&) {
+      error_caught = true;
+    }
+    clear_streams();
+  });
+  t.join();
+
+  CHECK(error_caught);
+}
+
+TEST_CASE("test new stream in threads") {
+  std::vector<std::thread> threads;
+  for (int i = 0; i < 1; ++i) {
+    threads.emplace_back([]() {
+      auto s = new_stream(default_device());
+      eval(arange(10, s));
+      clear_streams();
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+}
+
+TEST_CASE("test thread unsafe stream") {
+  auto s = new_thread_unsafe_stream(default_device());
+  int expected = sum(arange(10, s)).item<int>();
+
+  int actual = 0;
+  std::thread t([&] {
+    actual = sum(arange(10, s)).item<int>();
+    clear_streams();
+  });
+  t.join();
+
+  CHECK_EQ(expected, actual);
+}
+
+TEST_CASE("test thread local stream") {
+  auto s = new_thread_local_stream(default_device());
+  int result = sum(arange(10, s)).item<int>();
+
+  std::atomic<int> finished = 0;
+  std::vector<std::thread> threads;
+  int num_threads = 4;
+  for (int i = 0; i < 4; ++i) {
+    threads.emplace_back([&]() {
+      int r = sum(arange(10, s)).item<int>();
+      CHECK_EQ(result, r);
+      finished += 1;
+      clear_streams();
+    });
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+  CHECK_EQ(finished, num_threads);
+}
+
 TEST_CASE("test get streams") {
+  // Initialize default CPU stream before querying
+  default_stream(Device::cpu);
   auto streams = get_streams();
 
   // At least the default CPU stream exists
@@ -175,4 +248,30 @@ TEST_CASE("test scheduler races") {
     y = exp(y);
   }
   eval(a, y);
+}
+
+// The fence orders work between two streams. Check that the consumer sees the
+// producer result for every combination of producer and consumer device.
+TEST_CASE("test cross stream fence ordering") {
+  if (!gpu::is_available()) {
+    return;
+  }
+  std::vector<Device::DeviceType> devices = {Device::cpu, Device::gpu};
+
+  for (auto pd : devices) {
+    for (auto cd : devices) {
+      auto ps = new_stream(pd);
+      auto cs = new_stream(cd);
+
+      array one = full({1}, 1.0f, float32, ps);
+      array x = full({64, 64}, 1.0f, float32, ps);
+      for (int i = 0; i < 20; ++i) {
+        x = add(x, one, ps);
+      }
+
+      // The consumer is on the other stream, so eval builds a fence.
+      array y = sum(x, cs);
+      CHECK_EQ(y.item<float>(), doctest::Approx(64 * 64 * 21.0f));
+    }
+  }
 }

@@ -75,14 +75,14 @@ struct Limits<bool> {
   static constexpr constant bool min = false;
 };
 
-template <>
-struct Limits<complex64_t> {
-  static constexpr constant complex64_t max = complex64_t(
-      metal::numeric_limits<float>::infinity(),
-      metal::numeric_limits<float>::infinity());
-  static constexpr constant complex64_t min = complex64_t(
-      -metal::numeric_limits<float>::infinity(),
-      -metal::numeric_limits<float>::infinity());
+template <typename T>
+struct Limits<complex_t<T>> {
+  inline static constexpr constant complex_t<T> max = complex_t<T>(
+      metal::numeric_limits<T>::infinity(),
+      metal::numeric_limits<T>::infinity());
+  inline static constexpr constant complex_t<T> min = complex_t<T>(
+      -metal::numeric_limits<T>::infinity(),
+      -metal::numeric_limits<T>::infinity());
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -353,6 +353,29 @@ inline complex64_t log1p(complex64_t in) {
   }
 }
 
+// https://github.com/pytorch/pytorch/blob/a82aae9d4a7827849ce50f31c4c7ee8f278d05f5/c10/metal/utils.h#L554
+inline float hypot(float x, float y) {
+  if (metal::isinf(x) || metal::isinf(y)) {
+    return metal::numeric_limits<float>::infinity();
+  }
+  if (metal::isnan(x) || metal::isnan(y)) {
+    return metal::numeric_limits<float>::quiet_NaN();
+  }
+  float a = metal::fmax(metal::fabs(x), metal::fabs(y));
+  float b = metal::fmin(metal::fabs(x), metal::fabs(y));
+  if (a == 0.0f) {
+    return 0.0f;
+  }
+  float r = (b / a) * (b / a);
+  float sqrt_1_plus_r = metal::precise::sqrt(1.0f + r);
+  float h1 = metal::sqrt(2.0f) * a;
+  float h2 = a + a * r / 2.0f;
+  float h3 = a * sqrt_1_plus_r;
+  bool is_h1 = (a == b);
+  bool is_h2 = ((sqrt_1_plus_r == 1.0f) && (r > 0.0f));
+  return metal::select(metal::select(h3, h2, is_h2), h1, is_h1);
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // SIMD shuffle ops
 ///////////////////////////////////////////////////////////////////////////////
@@ -446,3 +469,27 @@ template <typename T, typename U>
 struct ConditionalType<true, T, U> {
   using type = T;
 };
+
+///////////////////////////////////////////////////////////////////////////////
+// Type casting utils
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename U, typename T>
+inline U cast_to(T val) {
+  return static_cast<U>(val);
+}
+
+template <>
+inline bool cast_to<bool, float>(float val) {
+  return (as_type<uint32_t>(val) & 0x7FFFFFFF) != 0;
+}
+
+template <>
+inline bool cast_to<bool, bfloat16_t>(bfloat16_t val) {
+  return (as_type<uint16_t>(val) & 0x7FFF) != 0;
+}
+
+template <>
+inline bool cast_to<bool, complex64_t>(complex64_t val) {
+  return cast_to<bool, float>(val.real) || cast_to<bool, float>(val.imag);
+}

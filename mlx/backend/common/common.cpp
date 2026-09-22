@@ -3,6 +3,7 @@
 
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/utils.h"
+#include "mlx/dtype_utils.h"
 #include "mlx/primitives.h"
 
 namespace mlx::core {
@@ -19,26 +20,27 @@ void AsStrided::eval(const std::vector<array>& inputs, array& out) {
         "AsStrided must be used with row contiguous arrays only.");
   }
 
-  // Compute the flags given the shape and strides
-  bool row_contiguous = true, col_contiguous = true;
-  size_t r = 1, c = 1;
-  for (int i = strides_.size() - 1, j = 0; i >= 0; i--, j++) {
-    row_contiguous &= (r == strides_[i]) || (shape_[i] == 1);
-    col_contiguous &= (c == strides_[j]) || (shape_[j] == 1);
-    r *= shape_[i];
-    c *= shape_[j];
+  auto [no_bsx_size, row_contiguous, col_contiguous] =
+      check_contiguity(shape_, strides_);
+
+  int64_t l = 0, h = 0;
+  bool has_negative_stride = false;
+  for (int i = 0; i < strides_.size(); i++) {
+    auto delta = strides_[i] * (shape_[i] - 1);
+    if (strides_[i] >= 0) {
+      h += delta;
+    } else {
+      l += delta;
+      has_negative_stride |= shape_[i] > 1;
+    }
   }
+  size_t data_size = out.size() == 0 ? 0 : (h - l) + 1;
+
   auto flags = in.flags();
-  // TODO: Compute the contiguous flag in a better way cause now we are
-  //       unnecessarily strict.
-  flags.contiguous = row_contiguous || col_contiguous;
+  flags.contiguous =
+      out.size() == 0 || (!has_negative_stride && no_bsx_size == data_size);
   flags.row_contiguous = row_contiguous;
   flags.col_contiguous = col_contiguous;
-
-  // There is no easy way to compute the actual data size so we use out.size().
-  // The contiguous flag will almost certainly not be set so no code should
-  // rely on data_size anyway.
-  size_t data_size = out.size();
 
   return out.copy_shared_buffer(in, strides_, flags, data_size, offset_);
 }
@@ -98,50 +100,10 @@ void NumberOfElements::eval(const std::vector<array>& inputs, array& out) {
     numel = 1.0 / numel;
   }
 
-  switch (out.dtype()) {
-    case bool_:
-      *out.data<bool>() = static_cast<bool>(numel);
-      break;
-    case uint8:
-      *out.data<uint8_t>() = static_cast<uint8_t>(numel);
-      break;
-    case uint16:
-      *out.data<uint16_t>() = static_cast<uint16_t>(numel);
-      break;
-    case uint32:
-      *out.data<uint32_t>() = static_cast<uint32_t>(numel);
-      break;
-    case uint64:
-      *out.data<uint64_t>() = static_cast<uint64_t>(numel);
-      break;
-    case int8:
-      *out.data<int8_t>() = static_cast<int8_t>(numel);
-      break;
-    case int16:
-      *out.data<int16_t>() = static_cast<int16_t>(numel);
-      break;
-    case int32:
-      *out.data<int32_t>() = static_cast<int32_t>(numel);
-      break;
-    case int64:
-      *out.data<int64_t>() = static_cast<int64_t>(numel);
-      break;
-    case float16:
-      *out.data<float16_t>() = static_cast<float16_t>(numel);
-      break;
-    case float32:
-      *out.data<float>() = static_cast<float>(numel);
-      break;
-    case bfloat16:
-      *out.data<bfloat16_t>() = static_cast<bfloat16_t>(numel);
-      break;
-    case float64:
-      *out.data<double>() = static_cast<double>(numel);
-      break;
-    case complex64:
-      *out.data<complex64_t>() = static_cast<complex64_t>(numel);
-      break;
-  }
+  dispatch_all_types(out.dtype(), [&](auto type_tag) {
+    using T = MLX_GET_TYPE(type_tag);
+    *out.data<T>() = static_cast<T>(numel);
+  });
 }
 
 std::pair<bool, Strides> prepare_reshape(const array& in, const array& out) {

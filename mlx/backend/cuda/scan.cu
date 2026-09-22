@@ -364,7 +364,7 @@ constexpr bool supports_scan_op() {
 }
 
 void scan_gpu_inplace(
-    array in,
+    const array& in,
     array& out,
     Scan::ReduceType reduce_type,
     int axis,
@@ -457,6 +457,11 @@ void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto in = inputs[0];
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
+
+  if (out.size() == 0) {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    return;
+  }
 
   if (in.flags().contiguous && in.strides()[axis_] != 0) {
     if (in.is_donatable() && in.itemsize() == out.itemsize()) {
