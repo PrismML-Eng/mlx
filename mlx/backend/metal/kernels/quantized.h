@@ -1093,6 +1093,101 @@ METAL_FUNC void qmv_impl(
   }
 }
 
+// Row-reuse form of qmv_wide for 2-bit weights. All 32 lanes split K in
+// 8-value slices, so each lane loads its x slice once per step and reuses it
+// across the simdgroup's `rows` output rows, and each decoded weight slice is
+// reused across the vecs_per_tg vectors. Same grid as qmv_wide_impl.
+template <typename T, int group_size, int bits, int vecs_per_tg, int rows>
+METAL_FUNC void qmv_wide_rr_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int in_vec_size,
+    const int out_vec_size,
+    const int M,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int num_simdgroups = 2;
+  constexpr int vpt = 8;
+  constexpr int step = vpt * SIMD_SIZE;
+
+  typedef float U;
+
+  const int row0 = tid.y * (rows * num_simdgroups) + rows * simd_gid;
+  const int vec0 = tid.x * vecs_per_tg;
+  const int in_vec_size_w = in_vec_size * bits / 8;
+  const int in_vec_size_g = in_vec_size / group_size;
+
+  U result[rows][vecs_per_tg];
+#pragma unroll
+  for (int r = 0; r < rows; r++) {
+#pragma unroll
+    for (int v = 0; v < vecs_per_tg; v++) {
+      result[r][v] = 0;
+    }
+  }
+
+  for (int k = simd_lid * vpt; k < in_vec_size; k += step) {
+    U xr[vecs_per_tg][vpt];
+#pragma unroll
+    for (int v = 0; v < vecs_per_tg; v++) {
+      const device T* xc = x + min(vec0 + v, M - 1) * in_vec_size + k;
+#pragma unroll
+      for (int i = 0; i < vpt; i++) {
+        xr[v][i] = static_cast<U>(xc[i]);
+      }
+    }
+    const int g = k / group_size;
+#pragma unroll
+    for (int r = 0; r < rows; r++) {
+      const int rr = min(row0 + r, out_vec_size - 1);
+      const device uint8_t* wc =
+          (const device uint8_t*)w + rr * in_vec_size_w + k * bits / 8;
+      U w_dq[vpt];
+      dequantize<U, vpt, bits>(
+          wc,
+          static_cast<U>(scales[rr * in_vec_size_g + g]),
+          static_cast<U>(biases[rr * in_vec_size_g + g]),
+          w_dq);
+#pragma unroll
+      for (int v = 0; v < vecs_per_tg; v++) {
+        U acc = 0;
+#pragma unroll
+        for (int i = 0; i < vpt; i++) {
+          acc += xr[v][i] * w_dq[i];
+        }
+        result[r][v] += acc;
+      }
+    }
+  }
+
+#pragma unroll
+  for (int r = 0; r < rows; r++) {
+#pragma unroll
+    for (int v = 0; v < vecs_per_tg; v++) {
+      result[r][v] = simd_sum(result[r][v]);
+    }
+  }
+
+  if (simd_lid == 0) {
+#pragma unroll
+    for (int r = 0; r < rows; r++) {
+      if (row0 + r < out_vec_size) {
+#pragma unroll
+        for (int v = 0; v < vecs_per_tg; v++) {
+          if (vec0 + v < M) {
+            y[(vec0 + v) * out_vec_size + row0 + r] =
+                static_cast<T>(result[r][v]);
+          }
+        }
+      }
+    }
+  }
+}
+
 // Affine analog of fp_qmv_wide. Weights carry a scale and bias per group, so
 // each group is decoded in 8-value sub-chunks (scale * q + bias, registers
 // bounded for any group_size) and reused across the vecs_per_tg vectors.
@@ -1109,6 +1204,23 @@ METAL_FUNC void qmv_wide_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  if constexpr (bits == 2 && group_size % 8 == 0) {
+    if (in_vec_size % (8 * SIMD_SIZE) == 0) {
+      qmv_wide_rr_impl<T, group_size, bits, vecs_per_tg, SIMD_SIZE / k_lanes>(
+          w,
+          scales,
+          biases,
+          x,
+          y,
+          in_vec_size,
+          out_vec_size,
+          M,
+          tid,
+          simd_gid,
+          simd_lid);
+      return;
+    }
+  }
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = SIMD_SIZE / k_lanes;
   constexpr int sub = 8; // values per sub-chunk (== bits bytes, byte-aligned)
@@ -2076,11 +2188,276 @@ template <
       simd_lid);
 }
 
+// NAX (Metal 4 tensor ops) body for affine_qmm_t_splitk, T=float, 2-bit,
+// gs128 (verify widths: the host sends M >= 13 here with 32-row tiles). The
+// threadgroup keeps the host's work split: 32 weight rows (tid.x), one 32-row
+// M tile (tid.y), one K partition (tid.z). Each 16-wide K step is one
+// 16x32x16 matmul2d per 16 rows of M: A = input rows, B = the 32 weight rows
+// dequantized straight into the right-operand fragment, so each weight is
+// decoded once for all rows. The 4 simdgroups take every 4th quantization
+// group of the partition; their partials are summed through threadgroup
+// memory (Xs / Ws, unused on this path). Fragment layout, descriptor and
+// cooperative-tensor copies follow steel/gemm/nax.h (BaseNAXFrag::get_coord /
+// mma) as used by qmm_t_nax. Products run at the tensor unit's FP32-input
+// precision (TF32-class, like qmm_t_nax), not the FP32 FMAs of the SIMD path.
+#if defined(__METAL_VERSION__) && (__METAL_VERSION__ >= 400) && \
+    defined(__has_include)
+#if __has_include(<MetalPerformancePrimitives/MetalPerformancePrimitives.h>)
+#define MLX_QMM_SPLITK_NAX 1
+#endif
+#endif
+#ifdef MLX_QMM_SPLITK_NAX
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+template <typename U>
+using splitk_nax_frag_t = typename metal::vec<U, 8>;
+
+// C[16 x 32] += A[16 x 16] * B[32 x 16]^T; B arrives as two 16x16 fragments.
+template <typename U>
+METAL_FUNC void splitk_nax_mma(
+    thread splitk_nax_frag_t<U>& Cn0,
+    thread splitk_nax_frag_t<U>& Cn1,
+    const thread splitk_nax_frag_t<U>& A,
+    const thread splitk_nax_frag_t<U>& Bn0,
+    const thread splitk_nax_frag_t<U>& Bn1) {
+  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+      16,
+      32,
+      16,
+      false,
+      true,
+      true,
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+
+  auto ct_a = gemm_op.template get_left_input_cooperative_tensor<U, U, U>();
+  auto ct_b = gemm_op.template get_right_input_cooperative_tensor<U, U, U>();
+  auto ct_c = gemm_op.template get_destination_cooperative_tensor<
+      metal::remove_addrspace_t<decltype(ct_a)>,
+      metal::remove_addrspace_t<decltype(ct_b)>,
+      U>();
+
+#pragma unroll
+  for (short i = 0; i < 8; i++) {
+    ct_a[i] = A[i];
+  }
+#pragma unroll
+  for (short i = 0; i < 8; i++) {
+    ct_b[i] = Bn0[i];
+    ct_b[8 + i] = Bn1[i];
+  }
+#pragma unroll
+  for (short i = 0; i < 8; i++) {
+    ct_c[i] = Cn0[i];
+    ct_c[8 + i] = Cn1[i];
+  }
+
+  gemm_op.run(ct_a, ct_b, ct_c);
+
+#pragma unroll
+  for (short i = 0; i < 8; i++) {
+    Cn0[i] = ct_c[i];
+    Cn1[i] = ct_c[8 + i];
+  }
+}
+
+// kHalves = 1: rows [0, 16) of the tile; 2: rows [0, 32).
+template <typename T, int group_size, int bits, int kHalves>
+METAL_FUNC void qmm_t_splitk_nax_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int K,
+    const int N,
+    const int rows,
+    const int k_partition_size,
+    const int row0,
+    uint simd_gid,
+    uint simd_lid,
+    threadgroup float* red0,
+    threadgroup float* red1) {
+  constexpr int kStep = 16; // K per matmul2d
+  constexpr int kSimd = 4; // simdgroups per threadgroup (host 32 x 2 x 2)
+  typedef float U;
+
+  const int K_w = K * bits / 8;
+  const int K_g = K / group_size;
+  const int n_groups = k_partition_size / group_size;
+
+  // Fragment coordinate of this lane (BaseNAXFrag::get_coord): elements 0..3
+  // sit at (fm, fn..fn+3), elements 4..7 at (fm + 8, fn..fn+3).
+  const short qid = simd_lid >> 2;
+  const short fm = ((qid & 4) | ((simd_lid >> 1) & 3));
+  const short fn = ((qid & 2) | (simd_lid & 1)) * 4;
+
+  // A rows are input rows of this tile; rows past `rows` are clamped and
+  // never stored.
+  const device T* xa[2 * kHalves];
+#pragma unroll
+  for (int h = 0; h < 2 * kHalves; h++) {
+    xa[h] = x + min(int(fm) + 8 * h, rows - 1) * K + fn;
+  }
+
+  // B rows are weight rows row0 + fm + 8 * j (j = 0, 1 -> Bn0; 2, 3 -> Bn1).
+  const device uint8_t* wr[4];
+  const device T* sr[4];
+  const device T* br[4];
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    const int rr = min(row0 + fm + 8 * j, N - 1);
+    wr[j] = (const device uint8_t*)w + rr * K_w + fn * bits / 8;
+    sr[j] = scales + rr * K_g;
+    br[j] = biases + rr * K_g;
+  }
+
+  splitk_nax_frag_t<U> C[2 * kHalves];
+#pragma unroll
+  for (int h = 0; h < 2 * kHalves; h++) {
+    C[h] = splitk_nax_frag_t<U>(0);
+  }
+
+  for (int g = simd_gid; g < n_groups; g += kSimd) {
+    U s[4];
+    U b[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      s[j] = static_cast<U>(sr[j][g]);
+      b[j] = static_cast<U>(br[j][g]);
+    }
+    for (int kk = 0; kk < group_size; kk += kStep) {
+      const int k = g * group_size + kk;
+      splitk_nax_frag_t<U> B0;
+      splitk_nax_frag_t<U> B1;
+
+      volatile int compiler_barrier;
+
+      U w_dq[4][4];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        dequantize<U, 4, bits>(wr[j] + k * bits / 8, s[j], b[j], w_dq[j]);
+      }
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        B0[i] = w_dq[0][i];
+        B0[4 + i] = w_dq[1][i];
+        B1[i] = w_dq[2][i];
+        B1[4 + i] = w_dq[3][i];
+      }
+
+#pragma unroll
+      for (int hh = 0; hh < kHalves; hh++) {
+        splitk_nax_frag_t<U> A;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          A[i] = static_cast<U>(xa[2 * hh][k + i]);
+          A[4 + i] = static_cast<U>(xa[2 * hh + 1][k + i]);
+        }
+        splitk_nax_mma<U>(C[2 * hh], C[2 * hh + 1], A, B0, B1);
+      }
+
+      (void)compiler_barrier;
+    }
+  }
+
+  // Few-row path: three disjoint partial arrays fit in the existing Xs/Ws.
+  // Keep the baseline pairwise addition order: (C0 + C1) + (C2 + C3).
+  // It needs 2 * 16 * SIMD_SIZE floats in red0, which only the FP32-typed
+  // Xs holds; an FP16-typed tile takes the tree reduction below, which sums
+  // in the same order within 8 * SIMD_SIZE floats per half.
+  if constexpr (kHalves == 1 && sizeof(T) == sizeof(float)) {
+    constexpr int partial_size = 16 * SIMD_SIZE;
+    if (simd_gid != 0) {
+      threadgroup float* dst =
+          simd_gid == 3 ? red1 : red0 + (simd_gid - 1) * partial_size;
+#pragma unroll
+      for (int h = 0; h < 2; h++) {
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          dst[(8 * h + i) * SIMD_SIZE + simd_lid] = C[h][i];
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 0) {
+#pragma unroll
+      for (int h = 0; h < 2; h++) {
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          const int idx = (8 * h + i) * SIMD_SIZE + simd_lid;
+          const U left = C[h][i] + red0[idx];
+          const U right = red0[partial_size + idx] + red1[idx];
+          const U acc = left + right;
+          const int v = fm + (i / 4) * 8;
+          const int r = row0 + 16 * h + fn + (i % 4);
+          if (v < rows && r < N)
+            y[v * N + r] = static_cast<T>(acc);
+        }
+      }
+    }
+    return;
+  }
+
+  // Sum the 4 simdgroups' partials (identical fragment layouts, so they line
+  // up element by element): 1 -> 0 and 3 -> 2, then 2 -> 0.
+  threadgroup float* red = (simd_gid & 2) ? red1 : red0;
+  if (simd_gid & 1) {
+#pragma unroll
+    for (int h = 0; h < 2 * kHalves; h++) {
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        red[(8 * h + i) * SIMD_SIZE + simd_lid] = C[h][i];
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (!(simd_gid & 1)) {
+#pragma unroll
+    for (int h = 0; h < 2 * kHalves; h++) {
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        C[h][i] += red[(8 * h + i) * SIMD_SIZE + simd_lid];
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 2) {
+#pragma unroll
+    for (int h = 0; h < 2 * kHalves; h++) {
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        red0[(8 * h + i) * SIMD_SIZE + simd_lid] = C[h][i];
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0) {
+    // C[2 * hh + c] holds rows 16 * hh + fm + (i / 4) * 8, weight rows
+    // row0 + 16 * c + fn + i % 4.
+#pragma unroll
+    for (int h = 0; h < 2 * kHalves; h++) {
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        const int v = 16 * (h / 2) + fm + (i / 4) * 8;
+        const int r = row0 + 16 * (h % 2) + fn + (i % 4);
+        const U acc = C[h][i] + red0[(8 * h + i) * SIMD_SIZE + simd_lid];
+        if (v < rows && r < N) {
+          y[v * N + r] = static_cast<T>(acc);
+        }
+      }
+    }
+  }
+}
+#endif
+
 template <
     typename T,
     const int group_size,
     const int bits,
     const bool aligned_N,
+    const bool use_nax = false,
     const int BM = 32,
     const int BK = 32,
     const int BN = 32>
@@ -2117,6 +2494,88 @@ template <
   biases += k_start / group_size;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
+#ifdef MLX_QMM_SPLITK_NAX
+  // The tensor-unit body is only correct on generation-18+ GPUs (M5 class);
+  // the host selects `use_nax` from metal::is_nax_available().
+  constexpr bool kSplitkNax = use_nax;
+  if constexpr (
+      kSplitkNax && metal::is_same_v<T, float> && bits == 2 &&
+      group_size == 128 && BM == 32 && BN == 32) {
+    static_assert(
+        2 * 16 * SIMD_SIZE * sizeof(float) <= BM * BK_padded * sizeof(T),
+        "splitk NAX reduction must fit in Xs / Ws");
+    const int rows = min(M - int(tid.y) * BM, BM);
+    const device T* xt = x + int(tid.y) * BM * static_cast<int64_t>(K);
+    device T* yt = y + int(tid.y) * BM * static_cast<int64_t>(N);
+    if (rows <= 16) {
+      qmm_t_splitk_nax_impl<T, group_size, bits, 1>(
+          (const device uint32_t*)wl,
+          scales,
+          biases,
+          xt,
+          yt,
+          K,
+          N,
+          rows,
+          k_partition_size,
+          int(tid.x) * BN,
+          simd_gid,
+          simd_lid,
+          (threadgroup float*)Xs,
+          (threadgroup float*)Ws);
+    } else {
+      qmm_t_splitk_nax_impl<T, group_size, bits, 2>(
+          (const device uint32_t*)wl,
+          scales,
+          biases,
+          xt,
+          yt,
+          K,
+          N,
+          rows,
+          k_partition_size,
+          int(tid.x) * BN,
+          simd_gid,
+          simd_lid,
+          (threadgroup float*)Xs,
+          (threadgroup float*)Ws);
+    }
+    return;
+  }
+  // FP16 input takes the same body: its fragments and accumulators are FP32
+  // (U), and the half activations, scales and offsets widen exactly on load,
+  // so every product and sum is the one the FP32 body forms from those
+  // values. The FP32 scratch of the cross-simdgroup reduction fits in the
+  // half-typed Xs / Ws for one 16-row half; wider tiles keep the SIMD body.
+  if constexpr (
+      kSplitkNax && metal::is_same_v<T, half> && bits == 2 &&
+      group_size == 128 && BM == 32 && BN == 32) {
+    static_assert(
+        2 * 8 * SIMD_SIZE * sizeof(float) <= BM * BK_padded * sizeof(T),
+        "splitk NAX half reduction must fit in Xs / Ws");
+    const int rows = min(M - int(tid.y) * BM, BM);
+    if (rows <= 16) {
+      const device T* xt = x + int(tid.y) * BM * static_cast<int64_t>(K);
+      device T* yt = y + int(tid.y) * BM * static_cast<int64_t>(N);
+      qmm_t_splitk_nax_impl<T, group_size, bits, 1>(
+          (const device uint32_t*)wl,
+          scales,
+          biases,
+          xt,
+          yt,
+          K,
+          N,
+          rows,
+          k_partition_size,
+          int(tid.x) * BN,
+          simd_gid,
+          simd_lid,
+          (threadgroup float*)Xs,
+          (threadgroup float*)Ws);
+      return;
+    }
+  }
+#endif
   qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
       (const device uint32_t*)wl,
       scales,

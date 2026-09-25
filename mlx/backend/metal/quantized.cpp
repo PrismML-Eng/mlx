@@ -1232,6 +1232,11 @@ void qmm_splitk(
   MTL::Size grid_dims(n_tiles, m_tiles, split_k);
 
   bool aligned = N % 32 == 0;
+  // The 2-bit gs128 split-K kernel carries a tensor-unit (NAX) body for
+  // few-row tiles. It is only correct on generation-18+ GPUs, so the host
+  // selects it; every other GPU takes the SIMD body.
+  bool use_nax = metal::is_nax_available() && bits == 2 && group_size == 128 &&
+      (x.dtype() == float32 || x.dtype() == float16);
   std::string type_string = get_type_string(x.dtype());
   std::string kname;
   kname.reserve(64);
@@ -1243,9 +1248,18 @@ void qmm_splitk(
       group_size,
       "_b_",
       bits,
-      aligned ? "_alN_true" : "_alN_false");
+      aligned ? "_alN_true" : "_alN_false",
+      use_nax ? "_nax_true" : "_nax_false");
   auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "qmm_t_splitk", mode, type_string, group_size, bits, aligned);
+      d,
+      kname,
+      "qmm_t_splitk",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      aligned,
+      use_nax);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 

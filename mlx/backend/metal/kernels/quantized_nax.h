@@ -656,6 +656,22 @@ dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
   }
 }
 
+// Same values as four dequantize<U, 4, 2> calls on the bytes of `word`.
+template <typename U>
+inline void
+dequantize_2bit_word(uint32_t word, U scale, U bias, threadgroup U* w_local) {
+  const float s = float(scale);
+  const float b = float(bias);
+  float sc[4] = {s, s / 4.0f, s / 16.0f, s / 64.0f};
+  for (int i = 0; i < 4; i++) {
+    const uint8_t wb = static_cast<uint8_t>((word >> (8 * i)) & 0xff);
+    w_local[4 * i] = static_cast<U>(sc[0] * (wb & 0x03) + b);
+    w_local[4 * i + 1] = static_cast<U>(sc[1] * (wb & 0x0c) + b);
+    w_local[4 * i + 2] = static_cast<U>(sc[2] * (wb & 0x30) + b);
+    w_local[4 * i + 3] = static_cast<U>(sc[3] * (wb & 0xc0) + b);
+  }
+}
+
 template <
     typename T,
     short BROWS,
@@ -1051,8 +1067,56 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   // Set the block
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
-  const int y_row = tid.y * BM;
-  const int y_col = tid.x * BN;
+  // Visit adjacent M tiles of each N tile so prompt-width calls reuse the
+  // packed weight tile while it remains in cache. For a fixed NAX grid this
+  // remaps each (M,N) tile exactly once; tid.z remains the batch index.
+  // 16-bit activations only: with FP32 activations the remap measured 5-23%
+  // slower at M=512 on an M5 Pro (2-bit gs128, N 5120..248320), and the
+  // linear order 8-10% faster than the pre-port kernel.
+  const int m_tiles = (M + BM - 1) / BM;
+  const int n_tiles = (N + BN - 1) / BN;
+  int y_row;
+  int y_col;
+  if (m_tiles == 1 || sizeof(T) != 2) {
+    y_row = int(tid.y) * BM;
+    y_col = int(tid.x) * BN;
+  } else {
+    const int tile_id = int(tid.y) * n_tiles + int(tid.x);
+    y_row = (tile_id % m_tiles) * BM;
+    y_col = (tile_id / m_tiles) * BN;
+  }
+
+#ifdef MLX_QMM_M16_NAX
+  // Few-row tiles (M - y_row <= 16 with the host's 32-row tile): the shared
+  // few-row core in quantized_utils.h. Simdgroups (0, 1) take columns
+  // [0, 32) and (2, 3) columns [32, 64), each pair splitting K; partials
+  // are summed through Ws, which this path does not otherwise use.
+  if constexpr (
+      bits == 2 && group_size == 128 && BM == 32 && BN == 64 && WM * WN == 4) {
+    if (M - y_row <= 16 && N < 65536) {
+      const uint cb = simd_gid >> 1;
+      const uint ks = simd_gid & 1;
+      threadgroup float* red = (threadgroup float*)Ws + cb * (16 * 32);
+      qmm_m16_block<T, 2>(
+          w,
+          scales,
+          biases,
+          x + y_row * static_cast<int64_t>(K),
+          y + y_row * static_cast<int64_t>(N),
+          K,
+          N,
+          M - y_row,
+          y_col + 32 * int(cb),
+          0,
+          K,
+          ks,
+          simd_lid,
+          red,
+          red);
+      return;
+    }
+  }
+#endif
 
   auto wl = (const device uint8_t*)w;
 
@@ -1073,13 +1137,32 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
 
-  const short tm = SM * (simd_gid / WN);
+  // Verify-width inputs (M <= SM rows left in this tile, e.g. M=13..16 with
+  // BM=32): the second row of simdgroups would multiply only zero rows.
+  //   1: those simdgroups skip their MMAs (bit-identical output).
+  //   2: all simdgroups take rows [0, SM); simdgroup row r does the K
+  //      sub-steps kk1 = r*SK (mod BK) and the halves are summed through
+  //      threadgroup memory at the end.
+  constexpr int kNaxRowFit = 2;
+  constexpr bool kRowFitShape = (BM == 32) && (WM == 2) && (BK == 2 * SK);
+  const bool row_fit =
+      kNaxRowFit != 0 && kRowFitShape && (M - y_row) <= int(SM);
+  const bool k_half = kNaxRowFit == 2 && row_fit;
+
+  const short tm = k_half ? short(0) : short(SM * (simd_gid / WN));
   const short tn = SN * (simd_gid % WN);
+  const short k_row = short(simd_gid / WN);
 
   constexpr bool transpose_a = false;
   constexpr bool transpose_b = true;
 
   const short sgp_sm = min(int(SM), M - (y_row + tm));
+  // Rows of MMA work this simdgroup does per BK step: [kk_first, BK) by
+  // kk_step.
+  const bool mma_idle = kNaxRowFit == 1 && row_fit && sgp_sm <= 0;
+  const short kk_first =
+      mma_idle ? short(BK) : (k_half ? short(k_row * SK) : short(0));
+  const short kk_step = k_half ? short(BK) : short(SK);
   const bool is_unaligned_sm = (sgp_sm != SM);
 
   const short sgp_sn = aligned_N ? SN : min(int(SN), N - (y_col + tn));
@@ -1094,11 +1177,45 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   x += tm * K;
 
+  // 2-bit: load the next K block of weights into registers before the MMAs.
+  // Same thread mapping and same Ws values as loader_w.
+  constexpr bool kPrefetchW2 = (bits == 2) && (BN == 64) && (BK == 64) &&
+      (WM * WN == 4) && (group_size >= BK) && (group_size % BK == 0);
+  const int pf_thr = int(simd_gid) * 32 + int(simd_lid);
+  const int pf_row = pf_thr >> 1;
+  const device uint32_t* pf_w =
+      w + (y_col + pf_row) * (K / 16) + (pf_thr & 1) * 2;
+  const device T* pf_s = scales + pf_row * K_g;
+  const device T* pf_b = biases + pf_row * K_g;
+  threadgroup T* pf_dst = Ws + pf_row * BK_padded + (pf_thr & 1) * 32;
+
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
+      uint32_t pf_w0 = 0;
+      uint32_t pf_w1 = 0;
+      T pf_scale = T(0);
+      T pf_bias = T(0);
+      if constexpr (kPrefetchW2 && kAlignedN.value) {
+        pf_w0 = pf_w[0];
+        pf_w1 = pf_w[1];
+        pf_scale = pf_s[0];
+        pf_bias = pf_b[0];
+      }
+
       for (int k = 0; k < K; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if constexpr (kAlignedN.value) {
+        if constexpr (kPrefetchW2 && kAlignedN.value) {
+          dequantize_2bit_word<T>(pf_w0, pf_scale, pf_bias, pf_dst);
+          dequantize_2bit_word<T>(pf_w1, pf_scale, pf_bias, pf_dst + 16);
+          if (k + BK < K) {
+            const int pf_k = k + BK;
+            const int pf_g = pf_k / group_size;
+            pf_w0 = pf_w[pf_k / 16];
+            pf_w1 = pf_w[pf_k / 16 + 1];
+            pf_scale = pf_s[pf_g];
+            pf_bias = pf_b[pf_g];
+          }
+        } else if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
           loader_w.load_safe(short2(BK, tgp_bn));
@@ -1107,7 +1224,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         STEEL_PRAGMA_NO_UNROLL
-        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+        for (int kk1 = kk_first; kk1 < BK; kk1 += kk_step) {
           NAXTile<T, TM, TK> Atile;
           NAXTile<T, TN, TK> Btile;
 
@@ -1132,11 +1249,42 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
         }
 
         x += BK;
-        loader_w.next();
+        if constexpr (!(kPrefetchW2 && kAlignedN.value)) {
+          loader_w.next();
+        }
       }
 
       // Store results to device memory
       threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if constexpr (kRowFitShape) {
+        if (k_half) {
+          // Simdgroup row 1 hands its partial sums to row 0 (same tn, same
+          // lane layout); Ws is free after the barrier above.
+          constexpr short kE = NAXTile<AccumType, TM, TN>::kElemsPerTile;
+          static_assert(
+              WN * 32 * kE * sizeof(AccumType) <= BN * BK_padded * sizeof(T),
+              "k-half reduction must fit in Ws");
+          threadgroup AccumType* red = (threadgroup AccumType*)Ws +
+              (simd_gid % WN) * (32 * kE) + simd_lid;
+          if (k_row != 0) {
+            STEEL_PRAGMA_UNROLL
+            for (short i = 0; i < kE; i++) {
+              red[i * 32] = Dtile.elems()[i];
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (k_row != 0) {
+            return;
+          }
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < kE; i++) {
+            Dtile.elems()[i] += red[i * 32];
+          }
+        } else if (mma_idle) {
+          return;
+        }
+      }
 
       if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(y + tm * N + tn, N);
