@@ -5,19 +5,18 @@
 #include "mlx/array.h"
 #include "mlx/backend/cuda/allocator.h"
 #include "mlx/backend/cuda/lru_cache.h"
-#include "mlx/backend/cuda/worker.h"
+#include "mlx/backend/cuda/utils.h"
 #include "mlx/stream.h"
 
-#include <cublasLt.h>
-#include <cuda.h>
-#include <cudnn.h>
-
+#include <memory>
 #include <unordered_map>
 
 namespace mlx::core::cu {
 
 // Compute a key and updatability flag for a CUDA graph by walking its nodes.
 std::pair<std::string, bool> subgraph_to_key(cudaGraph_t graph);
+
+class Worker;
 
 class CommandEncoder {
  public:
@@ -35,6 +34,7 @@ class CommandEncoder {
   };
 
   explicit CommandEncoder(Device& d);
+  ~CommandEncoder();
 
   CommandEncoder(const CommandEncoder&) = delete;
   CommandEncoder& operator=(const CommandEncoder&) = delete;
@@ -57,7 +57,7 @@ class CommandEncoder {
 
   template <typename F, typename... Params>
   void add_kernel_node_ex(
-      F* func,
+      F func,
       dim3 grid_dim,
       dim3 block_dim,
       dim3 cluster_dim,
@@ -69,13 +69,18 @@ class CommandEncoder {
     ([&](auto&& p) { ptrs[i++] = static_cast<void*>(&p); }(
          std::forward<Params>(params)),
      ...);
-    add_kernel_node_raw(
-        reinterpret_cast<void*>(func),
-        grid_dim,
-        block_dim,
-        cluster_dim,
-        smem_bytes,
-        ptrs);
+    if constexpr (std::is_same_v<F, CUfunction>) {
+      add_kernel_node_raw(
+          func, grid_dim, block_dim, cluster_dim, smem_bytes, ptrs);
+    } else {
+      add_kernel_node_raw(
+          reinterpret_cast<void*>(func),
+          grid_dim,
+          block_dim,
+          cluster_dim,
+          smem_bytes,
+          ptrs);
+    }
   }
 
   void add_kernel_node_raw(
@@ -133,13 +138,15 @@ class CommandEncoder {
     std::string id;
   };
 
+  void commit_impl();
+  void clear_graph_state();
   void insert_graph_dependencies(GraphNode node);
   void insert_graph_dependencies(std::vector<GraphNode> nodes);
 
   Device& device_;
   CudaStream stream_;
   CudaGraph graph_;
-  Worker worker_;
+  std::shared_ptr<Worker> worker_;
   int node_count_{0};
   bool in_concurrent_{false};
   std::vector<cudaGraphNode_t> from_nodes_;
@@ -169,10 +176,6 @@ class Device {
 
   // Make this device the current cuda device, this method is thread-safe.
   void make_current();
-
-  CommandEncoder& get_command_encoder(Stream s);
-  cublasLtHandle_t get_cublaslt_handle();
-  cudnnHandle_t get_cudnn_handle();
 
   int cuda_device() const {
     return device_;
@@ -205,13 +208,13 @@ class Device {
   int managed_memory_;
   int memory_pools_;
   std::string device_name_;
-  cublasLtHandle_t cublaslt_handle_{nullptr};
-  cudnnHandle_t cudnn_handle_{nullptr};
-  std::unordered_map<int, CommandEncoder> encoders_;
 };
 
-Device& device(int cuda_device);
-Device& device(mlx::core::Device d);
-CommandEncoder& get_command_encoder(Stream s);
+MLX_API Device& device(int cuda_device);
+MLX_API Device& device(mlx::core::Device d);
+MLX_API CommandEncoder& get_command_encoder(Stream s);
+
+std::unordered_map<int, CommandEncoder>& get_command_encoders();
+std::unordered_map<int, CommandEncoder>& get_global_command_encoders();
 
 } // namespace mlx::core::cu

@@ -55,7 +55,7 @@ void init_linalg(nb::module_& parent_module) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def norm(a: array, /, ord: Union[None, int, float, str] = None, axis: Union[None, int, list[int]] = None, keepdims: bool = False, *, stream: Union[None, Stream, Device] = None) -> array"),
+          "def norm(a: array, /, ord: None | int | float | str = None, axis: None | int | list[int] = None, keepdims: bool = False, *, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Matrix or vector norm.
 
@@ -177,7 +177,7 @@ void init_linalg(nb::module_& parent_module) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def qr(a: array, *, stream: Union[None, Stream, Device] = None) -> Tuple[array, array]"),
+          "def qr(a: array, *, stream: StreamOrDevice = None) -> tuple[array, array]"),
       R"pbdoc(
         The QR factorization of the input matrix.
 
@@ -220,7 +220,7 @@ void init_linalg(nb::module_& parent_module) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def svd(a: array, compute_uv: bool = True, *, stream: Union[None, Stream, Device] = None) -> Tuple[array, array, array]"),
+          "def svd(a: array, compute_uv: bool = True, *, stream: StreamOrDevice = None) -> tuple[array, array, array]"),
       R"pbdoc(
         The Singular Value Decomposition (SVD) of the input matrix.
 
@@ -246,8 +246,7 @@ void init_linalg(nb::module_& parent_module) {
       "a"_a,
       nb::kw_only(),
       "stream"_a = nb::none(),
-      nb::sig(
-          "def inv(a: array, *, stream: Union[None, Stream, Device] = None) -> array"),
+      nb::sig("def inv(a: array, *, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Compute the inverse of a square matrix.
 
@@ -271,7 +270,7 @@ void init_linalg(nb::module_& parent_module) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def tri_inv(a: array, upper: bool = False, *, stream: Union[None, Stream, Device] = None) -> array"),
+          "def tri_inv(a: array, upper: bool = False, *, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Compute the inverse of a triangular square matrix.
 
@@ -296,7 +295,7 @@ void init_linalg(nb::module_& parent_module) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def cholesky(a: array, upper: bool = False, *, stream: Union[None, Stream, Device] = None) -> array"),
+          "def cholesky(a: array, upper: bool = False, *, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Compute the Cholesky decomposition of a real symmetric positive semi-definite matrix.
 
@@ -326,7 +325,7 @@ void init_linalg(nb::module_& parent_module) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def cholesky_inv(L: array, upper: bool = False, *, stream: Union[None, Stream, Device] = None) -> array"),
+          "def cholesky_inv(a: array, upper: bool = False, *, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Compute the inverse of a real symmetric positive semi-definite matrix using it's Cholesky decomposition.
 
@@ -347,7 +346,8 @@ void init_linalg(nb::module_& parent_module) {
         If the input matrix is not a triangular matrix behaviour is undefined.
 
         Args:
-            L (array): Input array.
+            a (array): Input array. This is the Cholesky factor
+              :math:`\mathbf{L}`, not :math:`\mathbf{A}` itself.
             upper (bool, optional): If ``True``, return the upper triangular Cholesky factor.
               If ``False``, return the lower triangular Cholesky factor. Default: ``False``.
             stream (Stream, optional): Stream or device. Defaults to ``None``
@@ -362,8 +362,7 @@ void init_linalg(nb::module_& parent_module) {
       "a"_a,
       nb::kw_only(),
       "stream"_a = nb::none(),
-      nb::sig(
-          "def pinv(a: array, *, stream: Union[None, Stream, Device] = None) -> array"),
+      nb::sig("def pinv(a: array, *, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Compute the (Moore-Penrose) pseudo-inverse of a matrix.
 
@@ -389,7 +388,7 @@ void init_linalg(nb::module_& parent_module) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def cross(a: array, b: array, axis: int = -1, *, stream: Union[None, Stream, Device] = None) -> array"),
+          "def cross(a: array, b: array, axis: int = -1, *, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Compute the cross product of two arrays along a specified axis.
 
@@ -448,7 +447,7 @@ void init_linalg(nb::module_& parent_module) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def eig(a: array, *, stream: Union[None, Stream, Device] = None) -> Tuple[array, array]"),
+          "def eig(a: array, *, stream: StreamOrDevice = None) -> tuple[array, array]"),
       R"pbdoc(
         Compute the eigenvalues and eigenvectors of a square matrix.
 
@@ -526,7 +525,7 @@ void init_linalg(nb::module_& parent_module) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def eigh(a: array, UPLO: str = 'L', *, stream: Union[None, Stream, Device] = None) -> Tuple[array, array]"),
+          "def eigh(a: array, UPLO: str = 'L', *, stream: StreamOrDevice = None) -> tuple[array, array]"),
       R"pbdoc(
         Compute the eigenvalues and eigenvectors of a complex Hermitian or
         real symmetric matrix.
@@ -572,7 +571,7 @@ void init_linalg(nb::module_& parent_module) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def lu(a: array, *, stream: Union[None, Stream, Device] = None) -> Tuple[array, array, array]"),
+          "def lu(a: array, *, stream: StreamOrDevice = None) -> tuple[array, array, array]"),
       R"pbdoc(
         Compute the LU factorization of the given matrix ``A``.
 
@@ -603,7 +602,7 @@ void init_linalg(nb::module_& parent_module) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def lu_factor(a: array, *, stream: Union[None, Stream, Device] = None) -> Tuple[array, array]"),
+          "def lu_factor(a: array, *, stream: StreamOrDevice = None) -> tuple[array, array]"),
       R"pbdoc(
         Computes a compact representation of the LU factorization.
 
@@ -623,7 +622,7 @@ void init_linalg(nb::module_& parent_module) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def solve(a: array, b: array, *, stream: Union[None, Stream, Device] = None) -> array"),
+          "def solve(a: array, b: array, *, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Compute the solution to a system of linear equations ``AX = B``.
 
@@ -645,7 +644,7 @@ void init_linalg(nb::module_& parent_module) {
       "upper"_a = false,
       "stream"_a = nb::none(),
       nb::sig(
-          "def solve_triangular(a: array, b: array, *, upper: bool = False, stream: Union[None, Stream, Device] = None) -> array"),
+          "def solve_triangular(a: array, b: array, *, upper: bool = False, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Computes the solution of a triangular system of linear equations ``AX = B``.
 
@@ -660,4 +659,78 @@ void init_linalg(nb::module_& parent_module) {
         Returns:
             array: The unique solution to the system ``AX = B``.
       )pbdoc");
+
+  m.def(
+      "det",
+      &mx::linalg::det,
+      "a"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig("def det(a: array, *, stream: StreamOrDevice = None) -> array"),
+      R"pbdoc(
+        Compute the determinant of a square matrix.
+
+        This function supports arrays with at least 2 dimensions. When the
+        input has more than two dimensions, the determinant is computed for
+        each matrix in the last two dimensions.
+
+        Args:
+            a (array): Input array.
+            stream (Stream, optional): Stream or device. Defaults to ``None``
+              in which case the default stream of the default device is used.
+
+        Returns:
+            array: The determinant(s) of the input matrix (matrices).
+
+        Example:
+            >>> A = mx.array([[1., 2.], [3., 4.]])
+            >>> mx.linalg.det(A, stream=mx.cpu)
+            array(-2, dtype=float32)
+      )pbdoc");
+
+  m.def(
+      "slogdet",
+      [](const mx::array& a, mx::StreamOrDevice s) {
+        auto result = mx::linalg::slogdet(a, s);
+        return nb::make_tuple(result.first, result.second);
+      },
+      "a"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def slogdet(a: array, *, stream: StreamOrDevice = None) -> tuple[array, array]"),
+      R"pbdoc(
+        Compute the sign and natural log of the absolute value of the
+        determinant of a square matrix.
+
+        This function supports arrays with at least 2 dimensions. When the
+        input has more than two dimensions, the sign and log-absolute-determinant
+        are computed for each matrix in the last two dimensions.
+
+        For a singular matrix, ``sign`` is 0 and ``logabsdet`` is ``-inf``.
+
+        The determinant can be reconstructed as ``det = sign * exp(logabsdet)``.
+        This is more numerically stable than computing the determinant directly
+        for matrices with large or small determinants.
+
+        Args:
+            a (array): Input array.
+            stream (Stream, optional): Stream or device. Defaults to ``None``
+              in which case the default stream of the default device is used.
+
+        Returns:
+            tuple(array, array): The ``sign`` and ``logabsdet`` of the
+              determinant. ``sign`` is -1, 0, or +1. ``logabsdet`` is the
+              natural log of the absolute value of the determinant.
+
+        Example:
+            >>> A = mx.array([[1., 2.], [3., 4.]])
+            >>> sign, logabsdet = mx.linalg.slogdet(A, stream=mx.cpu)
+            >>> sign
+            array(-1, dtype=float32)
+            >>> logabsdet
+            array(0.693147, dtype=float32)
+      )pbdoc");
+  // Array API standard aliases (https://data-apis.org/array-api/latest/).
+  parent_module.attr("matrix_norm") = m.attr("norm");
 }

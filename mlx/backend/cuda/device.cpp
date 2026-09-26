@@ -1,7 +1,6 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/cuda/device.h"
-#include "mlx/backend/cuda/jit_module.h"
 #include "mlx/backend/cuda/worker.h"
 #include "mlx/backend/gpu/device_info.h"
 #include "mlx/utils.h"
@@ -55,14 +54,7 @@ Device::Device(int device) : device_(device) {
       &memory_pools_, cudaDevAttrMemoryPoolsSupported, device_));
 }
 
-Device::~Device() {
-  if (cudnn_handle_) {
-    CHECK_CUDNN_ERROR(cudnnDestroy(cudnn_handle_));
-  }
-  if (cublaslt_handle_) {
-    CHECK_CUBLAS_ERROR(cublasLtDestroy(cublaslt_handle_));
-  }
-}
+Device::~Device() = default;
 
 void Device::make_current() {
   // We need to set/get current CUDA device very frequently, cache it to reduce
@@ -74,30 +66,6 @@ void Device::make_current() {
     CHECK_CUDA_ERROR(cudaSetDevice(device_));
     current = device_;
   }
-}
-
-CommandEncoder& Device::get_command_encoder(Stream s) {
-  auto it = encoders_.find(s.index);
-  if (it == encoders_.end()) {
-    it = encoders_.try_emplace(s.index, *this).first;
-  }
-  return it->second;
-}
-
-cublasLtHandle_t Device::get_cublaslt_handle() {
-  if (!cublaslt_handle_) {
-    make_current();
-    CHECK_CUBLAS_ERROR(cublasLtCreate(&cublaslt_handle_));
-  }
-  return cublaslt_handle_;
-}
-
-cudnnHandle_t Device::get_cudnn_handle() {
-  if (!cudnn_handle_) {
-    make_current();
-    CHECK_CUDNN_ERROR(cudnnCreate(&cudnn_handle_));
-  }
-  return cudnn_handle_;
 }
 
 CommandEncoder::CaptureContext::CaptureContext(CommandEncoder& enc) : enc(enc) {
@@ -238,13 +206,19 @@ CommandEncoder::CommandEncoder(Device& d)
     : device_(d),
       stream_(d),
       graph_(d),
-      worker_(d),
+      worker_(std::make_shared<Worker>(d)),
       graph_cache_("MLX_CUDA_GRAPH_CACHE_SIZE", /* default_capacity */ 400) {
   std::tie(max_ops_per_graph_, max_mb_per_graph_) = get_graph_limits(d);
+  worker_->start();
+}
+
+CommandEncoder::~CommandEncoder() {
+  synchronize();
+  worker_->stop();
 }
 
 void CommandEncoder::add_completed_handler(std::function<void()> task) {
-  worker_.add_task(std::move(task));
+  worker_->add_task(std::move(task));
 }
 
 void CommandEncoder::set_input_array(const array& arr) {
@@ -488,6 +462,42 @@ bool CommandEncoder::needs_commit() {
 
 void CommandEncoder::commit() {
   nvtx3::scoped_range r("CommandEncoder::commit");
+  try {
+    commit_impl();
+  } catch (...) {
+    // Clear pending CUDA error first.
+    cudaGetLastError();
+    // Clear states.
+    clear_graph_state();
+    node_count_ = 0;
+    bytes_in_graph_ = 0;
+    // Clear graph.
+    try {
+      graph_.reset();
+    } catch (...) {
+      // Destroying could fail.
+      graph_.release();
+    }
+    try {
+      graph_ = CudaGraph(device_);
+    } catch (...) {
+      // Keep the original error.
+    }
+    // Re-throw the error.
+    throw;
+  }
+}
+
+void CommandEncoder::synchronize() {
+  CHECK_CUDA_ERROR(cudaStreamSynchronize(stream_));
+  auto p = std::make_shared<std::promise<void>>();
+  std::future<void> f = p->get_future();
+  add_completed_handler([p = std::move(p)]() { p->set_value(); });
+  commit();
+  f.wait();
+}
+
+void CommandEncoder::commit_impl() {
   if (!temporaries_.empty()) {
     add_completed_handler([temporaries = std::move(temporaries_)]() {});
   }
@@ -546,43 +556,40 @@ void CommandEncoder::commit() {
     }
 
     // Reset state
-    from_nodes_.clear();
-    to_nodes_.clear();
-    graph_deps_key_.clear();
-    graph_nodes_key_.clear();
-    node_map_.clear();
+    clear_graph_state();
     graph_ = CudaGraph(device_);
-    is_graph_updatable_ = true;
   }
 
   // Put completion handlers in a batch.
-  worker_.commit(stream_);
+  worker_->commit(stream_);
   node_count_ = 0;
   bytes_in_graph_ = 0;
 }
 
-void CommandEncoder::synchronize() {
-  CHECK_CUDA_ERROR(cudaStreamSynchronize(stream_));
-  auto p = std::make_shared<std::promise<void>>();
-  std::future<void> f = p->get_future();
-  add_completed_handler([p = std::move(p)]() { p->set_value(); });
-  commit();
-  f.wait();
+void CommandEncoder::clear_graph_state() {
+  from_nodes_.clear();
+  to_nodes_.clear();
+  graph_deps_key_.clear();
+  graph_nodes_key_.clear();
+  node_map_.clear();
+  active_deps_.clear();
+  active_outputs_.clear();
+  concurrent_nodes_.clear();
+  is_graph_updatable_ = true;
 }
 
 Device& device(int cuda_device) {
-  static auto devices = []() {
-    std::vector<Device> devices;
+  // The devices are leak intentionally as user code may still be accessing
+  // device after main thread teardown.
+  static auto* devices = []() {
+    auto* devices = new std::vector<Device>;
     int device_count = gpu::device_count();
     for (int i = 0; i < device_count; ++i) {
-      devices.emplace_back(i);
+      devices->emplace_back(i);
     }
-    // Initialize the jit module cache here ensures it is not unloaded before
-    // any evaluation is done.
-    get_jit_module_cache();
     return devices;
   }();
-  return devices.at(cuda_device);
+  return devices->at(cuda_device);
 }
 
 Device& device(mlx::core::Device d) {
@@ -590,7 +597,30 @@ Device& device(mlx::core::Device d) {
 }
 
 CommandEncoder& get_command_encoder(Stream s) {
-  return device(s.device).get_command_encoder(s);
+  auto& encoders = get_command_encoders();
+  auto it = encoders.find(s.index);
+  if (it == encoders.end()) {
+    auto& global_encoders = get_global_command_encoders();
+    it = global_encoders.find(s.index);
+    if (it == global_encoders.end()) {
+      throw std::runtime_error(
+          fmt::format(
+              "There is no Stream(gpu, {}) in current thread.", s.index));
+    }
+  }
+  return it->second;
+}
+
+std::unordered_map<int, CommandEncoder>& get_command_encoders() {
+  static thread_local std::unordered_map<int, CommandEncoder> encoders;
+  return encoders;
+}
+
+std::unordered_map<int, CommandEncoder>& get_global_command_encoders() {
+  // encoders are leaked intentionally as they would synchronize on process
+  // shutdown
+  static auto* encoders = new std::unordered_map<int, CommandEncoder>();
+  return *encoders;
 }
 
 } // namespace mlx::core::cu

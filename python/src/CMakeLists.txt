@@ -2,6 +2,7 @@ nanobind_add_module(
   core
   NB_STATIC
   STABLE_ABI
+  FREE_THREADED
   LTO
   NOMINSIZE
   NB_DOMAIN
@@ -27,7 +28,8 @@ nanobind_add_module(
   ${CMAKE_CURRENT_SOURCE_DIR}/linalg.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/constants.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/trees.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/print.cpp)
 
 if(MLX_BUILD_PYTHON_STUBS)
   nanobind_add_stub(

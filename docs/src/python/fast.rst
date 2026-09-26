@@ -10,8 +10,10 @@ Fast
 
   rms_norm
   layer_norm
+  cross_entropy
   rope
   scaled_dot_product_attention
   spec_decode_verify
   metal_kernel
   cuda_kernel
+  precompiled_cuda_kernel

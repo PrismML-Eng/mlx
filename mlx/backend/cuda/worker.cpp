@@ -7,16 +7,25 @@ namespace mlx::core::cu {
 
 Worker::Worker(Device& d)
     : signal_stream_(d),
-      signal_event_(d, cudaEventDisableTiming | cudaEventBlockingSync),
-      worker_(&Worker::thread_fn, this) {}
+      signal_event_(d, cudaEventDisableTiming | cudaEventBlockingSync) {}
 
-Worker::~Worker() {
+Worker::~Worker() = default;
+
+void Worker::start() {
+  // Note that |shared_from_this| can not be called in constructor.
+  worker_ = std::thread(&Worker::thread_fn, shared_from_this());
+  // Detach the thread and let it free itself after finishing tasks.
+  // This is to avoid deadlock when joining threads on exit on Windows:
+  // https://developercommunity.visualstudio.com/t/1654756
+  worker_.detach();
+}
+
+void Worker::stop() {
   {
     std::lock_guard lock(mtx_);
     stop_ = true;
   }
   cond_.notify_one();
-  worker_.join();
 }
 
 void Worker::add_task(std::function<void()> task) {
@@ -48,14 +57,17 @@ void Worker::commit(cudaStream_t stream) {
 }
 
 void Worker::thread_fn() {
-  while (!stop_) {
-    uint64_t current_batch = 0;
+  uint64_t current_batch = 0;
+  while (true) {
     Tasks tasks;
     {
       std::unique_lock<std::mutex> lk(mtx_);
-      cond_.wait(lk, [this, &current_batch] {
+      cond_.wait(lk, [this, current_batch] {
         return this->signaled_batch_ > current_batch || this->stop_;
       });
+      if (stop_) {
+        return;
+      }
       current_batch = signaled_batch_;
       auto end = worker_tasks_.upper_bound(current_batch);
       for (auto it = worker_tasks_.begin(); it != end; ++it) {

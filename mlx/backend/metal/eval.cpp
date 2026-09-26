@@ -6,24 +6,24 @@
 #include "mlx/backend/metal/utils.h"
 #include "mlx/primitives.h"
 #include "mlx/scheduler.h"
+#include "mlx/utils.h"
 
 namespace mlx::core::gpu {
 
 void init() {}
 
-void new_stream(Stream stream) {
-  if (stream.device == mlx::core::Device::gpu) {
-    metal::get_command_encoder(stream);
-  }
+void new_stream(Stream s) {
+  assert(s.device == Device::gpu);
+  auto& encoders = metal::get_command_encoders();
+  auto& d = metal::device(s.device);
+  encoders.try_emplace(s.index, d, s.index, d.residency_sets());
 }
 
-inline void check_error(MTL::CommandBuffer* cbuf) {
-  if (cbuf->status() == MTL::CommandBufferStatusError) {
-    std::ostringstream msg;
-    msg << "[METAL] Command buffer execution failed: "
-        << cbuf->error()->localizedDescription()->utf8String();
-    throw std::runtime_error(msg.str());
-  }
+void new_thread_unsafe_stream(Stream s) {
+  assert(s.device == Device::gpu);
+  auto& encoders = metal::get_global_command_encoders();
+  auto& d = metal::device(s.device);
+  encoders.try_emplace(s.index, d, s.index, d.residency_sets());
 }
 
 void eval(array& arr) {
@@ -59,17 +59,12 @@ void eval(array& arr) {
   if (encoder.needs_commit()) {
     encoder.end_encoding();
     scheduler::notify_new_task(s);
-    command_buffer->addCompletedHandler(
-        [s, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
-          scheduler::notify_task_completion(s);
-          check_error(cbuf);
-        });
-    encoder.commit();
+    encoder.commit([s, buffers = std::move(buffers)]() {
+      scheduler::notify_task_completion(s);
+    });
   } else {
     command_buffer->addCompletedHandler(
-        [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
-          check_error(cbuf);
-        });
+        [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {});
   }
 }
 
@@ -78,20 +73,18 @@ void finalize(Stream s) {
   auto& encoder = metal::get_command_encoder(s);
   auto* cb = encoder.get_command_buffer();
   encoder.end_encoding();
-  cb->addCompletedHandler([](MTL::CommandBuffer* cbuf) { check_error(cbuf); });
   encoder.commit();
 }
 
 void synchronize(Stream s) {
-  auto pool = metal::new_scoped_memory_pool();
-  auto& encoder = metal::get_command_encoder(s);
-  auto* cb = encoder.get_command_buffer();
-  cb->retain();
-  encoder.end_encoding();
-  encoder.commit();
-  cb->waitUntilCompleted();
-  check_error(cb);
-  cb->release();
+  metal::get_command_encoder(s).synchronize();
+}
+
+void clear_streams() {
+  metal::get_command_encoders().clear();
+  if (is_main_thread()) {
+    metal::get_global_command_encoders().clear();
+  }
 }
 
 } // namespace mlx::core::gpu
