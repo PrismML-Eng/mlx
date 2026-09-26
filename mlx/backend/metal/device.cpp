@@ -963,8 +963,9 @@ bool is_nax_available() {
     // every shape routed to steel_gemm_fused_nax; quantized qmm_t ~400 abs err;
     // non-nax fallback bit-matches stock mlx). Require gen >= 18 on every
     // device class until the g17 path is fixed and correctness-gated.
-    (void)arch;
-    can_use_nax &= gen >= 18;
+    // EXPERIMENT (uncommitted): the MLX.fast challenge core's rule, gen >= 17
+    // on desktop parts, so the g17 M5 Pro exercises the tensor kernels.
+    can_use_nax &= gen >= (arch == 'p' ? 18 : 17);
     return can_use_nax;
   };
   static bool is_nax_available_ = _check_nax();
