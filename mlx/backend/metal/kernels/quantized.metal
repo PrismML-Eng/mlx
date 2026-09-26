@@ -146,9 +146,12 @@
 
 #define instantiate_quantized_all_splitk_qmm(type, group_size, bits)                           \
   instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, group_size, bits, true, false)  \
-  instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, group_size, bits, false, false) \
-  instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, group_size, bits, true, true)   \
-  instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, group_size, bits, false, true)
+  instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, group_size, bits, false, false)
+
+// The NAX body exists only for float / float16 at gs128, 2 bits.
+#define instantiate_quantized_splitk_qmm_nax(type)                                  \
+  instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, 128, 2, true, true)  \
+  instantiate_quantized_splitk_qmm(affine_qmm_t_splitk, type, 128, 2, false, true)
 
 #define instantiate_quantized_all_rhs(type, group_size, bits) \
   instantiate_gather_qmm_rhs(affine_gather_qmm_rhs, affine_gather_qmm_rhs_nt, type, group_size, bits, 16, 32, 32, 1, 2, true) \
@@ -183,4 +186,6 @@
   instantiate_quantized_groups(6) \
   instantiate_quantized_groups(8)
 
-instantiate_quantized_all() // clang-format on
+instantiate_quantized_all()
+instantiate_quantized_splitk_qmm_nax(float)
+instantiate_quantized_splitk_qmm_nax(float16_t) // clang-format on

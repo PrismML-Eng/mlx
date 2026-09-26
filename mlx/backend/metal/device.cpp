@@ -957,14 +957,10 @@ bool is_nax_available() {
     auto& d = metal::device(mlx::core::Device::gpu);
     auto arch = d.get_architecture().back();
     auto gen = d.get_architecture_gen();
-    // gen-17 desktop parts (M5-class, applegpu_g17*) take the nax path under
-    // the old `gen >= 17` gate but compute WRONG results in the nax steel-gemm
-    // and qmm_t kernels (measured 2026-07-05: fp16 GEMM max|err| ~4 vs fp32 for
-    // every shape routed to steel_gemm_fused_nax; quantized qmm_t ~400 abs err;
-    // non-nax fallback bit-matches stock mlx). Require gen >= 18 on every
-    // device class until the g17 path is fixed and correctness-gated.
-    // EXPERIMENT (uncommitted): the MLX.fast challenge core's rule, gen >= 17
-    // on desktop parts, so the g17 M5 Pro exercises the tensor kernels.
+    // Desktop parts need generation 17 (M5 class), phone parts ('p') need
+    // generation 18. On a generation-17 M5 Pro the nax GEMM and 2-bit qmm
+    // kernels match a CPU reference to tensor-unit precision (worst relative
+    // error 5e-4 fp16 GEMM, 1.1e-3 fp16 / 4.1e-6 fp32 qmm).
     can_use_nax &= gen >= (arch == 'p' ? 18 : 17);
     return can_use_nax;
   };

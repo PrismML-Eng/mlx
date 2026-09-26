@@ -2495,8 +2495,8 @@ template <
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
 #ifdef MLX_QMM_SPLITK_NAX
-  // The tensor-unit body is only correct on generation-18+ GPUs (M5 class);
-  // the host selects `use_nax` from metal::is_nax_available().
+  // The host sets `use_nax` only when metal::is_nax_available() reports a
+  // tensor unit; every other GPU takes the SIMD body below.
   constexpr bool kSplitkNax = use_nax;
   if constexpr (
       kSplitkNax && metal::is_same_v<T, float> && bits == 2 &&
