@@ -170,7 +170,8 @@ if(NOT MLX_METAL_JIT)
     build_kernel(steel/gemm/kernels/steel_gemm_segmented_nax
                  ${STEEL_NAX_HEADERS})
 
-    build_kernel(quantized_nax quantized_nax.h ${STEEL_NAX_HEADERS})
+    build_kernel(quantized_nax quantized_nax.h quantized_utils.h
+                 ${STEEL_NAX_HEADERS})
     build_kernel(gated_delta_update_nax gated_delta_update_nax.h
                  ${STEEL_NAX_HEADERS})
     build_kernel(fp_quantized_nax fp4.h fp8.h fp_quantized_nax.h

@@ -1233,11 +1233,11 @@ std::vector<array> spec_decode_verify(
     auto mism = not_equal(d, t_pref, s);
     auto j = broadcast_to(
         reshape(arange(K, int32, s), Shape{1, K}, s), Shape{B, K}, s);
-    auto n_acc = min(
-        where(mism, j, full(Shape{B, K}, K, int32, s), s),
-        /*axis=*/1,
-        /*keepdims=*/false,
-        s); // [B]
+    auto n_acc =
+        min(where(mism, j, full(Shape{B, K}, K, int32, s), s),
+            /*axis=*/1,
+            /*keepdims=*/false,
+            s); // [B]
     auto n_acc2 = reshape(n_acc, Shape{B, 1}, s);
     auto corrected = take_along_axis(t, n_acc2, /*axis=*/1, s); // [B, 1]
     auto j1 = broadcast_to(
@@ -1250,7 +1250,8 @@ std::vector<array> spec_decode_verify(
     auto committed = where(
         less(j1, nacc_b, s),
         d_ext,
-        where(equal(j1, nacc_b, s), corr_b, zeros(Shape{B, K + 1}, int32, s), s),
+        where(
+            equal(j1, nacc_b, s), corr_b, zeros(Shape{B, K + 1}, int32, s), s),
         s);
     return {n_acc, committed};
   };

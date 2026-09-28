@@ -5,6 +5,7 @@
 #include "mlx/backend/metal/kernels/steel/gemm/gemm.h"
 #include "mlx/backend/metal/kernels/steel/gemm/nax.h"
 #include "mlx/backend/metal/kernels/steel/gemm/loader.h"
+#include "mlx/backend/metal/kernels/quantized_utils.h"
 #include "mlx/backend/metal/kernels/quantized_nax.h"
 
 #define instantiate_quantized(name, type, group_size, bits, bm, bn, bk, wm, wn)  \
