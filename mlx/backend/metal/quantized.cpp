@@ -403,6 +403,23 @@ array quantize_dequantize_input(
 
 } // namespace
 
+// An FP32 input may arrive with FP16 or BF16 affine scales and biases (see
+// quantized_matmul). Only qmv_fast reads them as they are; every other kernel
+// gets them widened here, as the op used to do before the matmul.
+inline array widen_to(const array& a, Dtype dtype, const Stream& s) {
+  if (a.dtype() == dtype) {
+    return a;
+  }
+  array out(a.shape(), dtype, nullptr, {});
+  copy_gpu(a, out, CopyType::General, s);
+  metal::get_command_encoder(s).add_temporary(out);
+  return out;
+}
+
+inline bool qmv_fast_takes(int N, int K, int bits) {
+  return N % 8 == 0 && K % qmv_fast_k_alignment(bits) == 0;
+}
+
 void qmv_quad(
     const array& x,
     const array& w,
@@ -494,28 +511,54 @@ void qmv(
   MTL::Size group_dims(bk, 2, 1);
   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
 
-  concatenate(
-      kname,
-      mode + (fast ? "_qmv_fast_" : "_qmv_"),
-      type_string,
-      "_gs_",
-      group_size,
-      "_b_",
-      bits,
-      use_narrow_qmv ? "_r_2" : "",
-      B > 1 ? "_batch_1" : "_batch_0",
-      global_scale ? "_hgs" : "");
-  auto kernel = get_quantized_kernel_wrapped(
-      d,
-      kname,
-      (fast ? "qmv_fast" : "qmv"),
-      mode,
-      type_string,
-      group_size,
-      bits,
-      B > 1,
-      global_scale.has_value(),
-      results_per_simdgroup);
+  bool mixed = scales.dtype() != x.dtype();
+  MTL::ComputePipelineState* kernel;
+  if (mixed) {
+    // FP32 input, narrower scales: eval_gpu routes only unbatched qmv_fast
+    // here.
+    auto scale_string = get_type_string(scales.dtype());
+    concatenate(
+        kname,
+        "affine_qmv_fast_mixed_",
+        type_string,
+        "_",
+        scale_string,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits);
+    kernel = get_quantized_kernel_wrapped(
+        d,
+        kname,
+        "qmv_fast_mixed",
+        mode,
+        type_string + ", " + scale_string,
+        group_size,
+        bits);
+  } else {
+    concatenate(
+        kname,
+        mode + (fast ? "_qmv_fast_" : "_qmv_"),
+        type_string,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits,
+        use_narrow_qmv ? "_r_2" : "",
+        B > 1 ? "_batch_1" : "_batch_0",
+        global_scale ? "_hgs" : "");
+    kernel = get_quantized_kernel_wrapped(
+        d,
+        kname,
+        (fast ? "qmv_fast" : "qmv"),
+        mode,
+        type_string,
+        group_size,
+        bits,
+        B > 1,
+        global_scale.has_value(),
+        results_per_simdgroup);
+  }
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -532,7 +575,9 @@ void qmv(
   compute_encoder.set_output_array(out, c++);
   compute_encoder.set_bytes(K, c++);
   compute_encoder.set_bytes(N, c++);
-  add_strides_and_shapes(compute_encoder, B <= 1, x, w, scales, biases, c);
+  if (!mixed) {
+    add_strides_and_shapes(compute_encoder, B <= 1, x, w, scales, biases, c);
+  }
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -1937,6 +1982,22 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     }
     mode = "affine_sym";
   }
+  if (scales.dtype() != x.dtype()) {
+    int B = out.size() / M / N;
+    bool quad = (K == 128 || (K == 64 && bits_ >= 2)) && is_power_of_2(bits_);
+    bool wide = M >= 2 && use_qmv_wide(mode, bits_, M, d);
+    bool mixed_qmv = mode == "affine" && transpose_ && M < vector_limit &&
+        B == 1 && !quad && !wide && qmv_fast_takes(N, K, bits_) &&
+        !(N >= 4096 && d.get_architecture_gen() == 17 &&
+          d.get_architecture().back() == 's' && mode == "nvfp4");
+    if (!mixed_qmv) {
+      scales = widen_to(scales, x.dtype(), s);
+      if (biases) {
+        biases = widen_to(*biases, x.dtype(), s);
+      }
+    }
+  }
+
   // It is a matrix matrix product.
   if (M >= vector_limit) {
     // Use split-K qmm for small M with transposed weights (non-batched only)

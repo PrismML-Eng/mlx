@@ -4799,7 +4799,16 @@ array quantized_matmul(
     throw std::invalid_argument(msg.str());
   }
   std::vector<array> inputs;
-  if (qmode == QuantizationMode::Affine) {
+  // On Metal an FP32 input keeps FP16 or BF16 scales and biases: the one-row
+  // kernel widens them in registers and the other kernels widen them first.
+  bool narrow_constants = qmode == QuantizationMode::Affine && biases &&
+      dtype == float32 && x.dtype() == float32 &&
+      (scales.dtype() == float16 || scales.dtype() == bfloat16) &&
+      biases->dtype() == scales.dtype() && to_stream(s).device == Device::gpu &&
+      metal::is_available();
+  if (narrow_constants) {
+    inputs = {x, w, scales, *biases};
+  } else if (qmode == QuantizationMode::Affine) {
     inputs = {astype(x, dtype), w, astype(scales, dtype)};
     if (biases) {
       inputs.push_back(astype(*biases, dtype));
