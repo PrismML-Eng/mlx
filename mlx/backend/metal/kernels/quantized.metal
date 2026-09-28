@@ -187,5 +187,23 @@
   instantiate_quantized_groups(8)
 
 instantiate_quantized_all()
+#define instantiate_qmv_fast_mixed(scale_type, group_size, bits)                       \
+  instantiate_kernel(                                                                 \
+      "affine_qmv_fast_mixed_float_" #scale_type "_gs_" #group_size "_b_" #bits,      \
+      affine_qmv_fast_mixed, float, scale_type, group_size, bits)
+#define instantiate_qmv_fast_mixed_groups(bits)                  \
+  instantiate_qmv_fast_mixed(float16_t, 128, bits)              \
+  instantiate_qmv_fast_mixed(float16_t, 64, bits)               \
+  instantiate_qmv_fast_mixed(float16_t, 32, bits)               \
+  instantiate_qmv_fast_mixed(bfloat16_t, 128, bits)             \
+  instantiate_qmv_fast_mixed(bfloat16_t, 64, bits)              \
+  instantiate_qmv_fast_mixed(bfloat16_t, 32, bits)
+instantiate_qmv_fast_mixed_groups(1)
+instantiate_qmv_fast_mixed_groups(2)
+instantiate_qmv_fast_mixed_groups(3)
+instantiate_qmv_fast_mixed_groups(4)
+instantiate_qmv_fast_mixed_groups(5)
+instantiate_qmv_fast_mixed_groups(6)
+instantiate_qmv_fast_mixed_groups(8)
 instantiate_quantized_splitk_qmm_nax(float)
 instantiate_quantized_splitk_qmm_nax(float16_t) // clang-format on

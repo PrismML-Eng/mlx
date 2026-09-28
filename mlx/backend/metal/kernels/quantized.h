@@ -840,11 +840,16 @@ METAL_FUNC U sym_derived_bias(U scale) {
   return bits == 1 ? U(-0.5f) * scale : -scale;
 }
 
-template <typename T, int group_size, int bits, bool bias_free = false>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    bool bias_free = false,
+    typename S = T>
 METAL_FUNC void qmv_fast_impl(
     const device uint32_t* w,
-    const device T* scales,
-    const device T* biases,
+    const device S* scales,
+    const device S* biases,
     const device T* x,
     device T* y,
     const constant int& in_vec_size,
@@ -888,8 +893,8 @@ METAL_FUNC void qmv_fast_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-      const device T* sl = scales + row * in_vec_size_g;
-      const device T* bl = biases + row * in_vec_size_g;
+      const device S* sl = scales + row * in_vec_size_g;
+      const device S* bl = biases + row * in_vec_size_g;
 
       U s = sl[0];
       U b = bias_free ? sym_derived_bias<U, bits, bias_free>(s) : U(bl[0]);
@@ -914,8 +919,8 @@ METAL_FUNC void qmv_fast_impl(
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-      const device T* sl = scales + row * in_vec_size_g;
-      const device T* bl = biases + row * in_vec_size_g;
+      const device S* sl = scales + row * in_vec_size_g;
+      const device S* bl = biases + row * in_vec_size_g;
 
       U s = in_bounds ? (U)sl[0] : (U)0;
       U b = bias_free ? sym_derived_bias<U, bits, bias_free>(s)
@@ -1819,6 +1824,33 @@ template <typename T, int group_size, int bits, int D, bool batched>
       tid,
       quad_gid,
       quad_lid);
+}
+
+// affine_qmv_fast for an FP32 input with FP16 or BF16 scales and biases, read
+// and widened in registers. Unbatched only.
+template <typename T, typename S, int group_size, int bits>
+[[kernel]] void affine_qmv_fast_mixed(
+    const device uint32_t* w [[buffer(0)]],
+    const device S* scales [[buffer(1)]],
+    const device S* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  qmv_fast_impl<T, group_size, bits, false, S>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      in_vec_size,
+      out_vec_size,
+      tid,
+      simd_gid,
+      simd_lid);
 }
 
 template <
