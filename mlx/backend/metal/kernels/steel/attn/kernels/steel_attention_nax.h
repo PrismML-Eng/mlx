@@ -141,6 +141,282 @@ template <
 
   static_assert(TQ == 1, "Check TQ");
   using otile_t = NAXTile<AccumType, TQ, TD>;
+  // One query block of at most kU rows (a draft block's 16 queries in the
+  // 64-row tile), no causal mask, no sinks: the four simdgroups pipeline the
+  // key blocks. Each round of four blocks, simdgroup s computes block
+  // 4j + s's scores (the same loads, mma chain, scale and masks as the loop
+  // below) and its row maxima; after a barrier every simdgroup runs the
+  // running-max chain over the four blocks (max is exact, so max(m, max(a, b))
+  // is max(max(m, a), b)); simdgroup s then forms its block's probabilities
+  // exp2(S - m) and the rescale factor exp2(m_prev - m) and leaves them in
+  // threadgroup memory; after a second barrier every simdgroup consumes the
+  // four blocks in key order for its own pair of O's head-dim fragments with
+  // the loop's own statements: l *= factor, the probabilities' row_reduce
+  // into l, O *= factor, then O += P V for key fragments 0 and 1. The scores of
+  // four blocks are computed at once instead of one after the other; every
+  // value that reaches the output is the same operation on the same operands.
+  if constexpr (TK == 2 && kNWarps == 4 && TD == 8 && TQ == 1) {
+    if (params->NQ == 1 && params->qL <= kU && !do_causal && !has_sinks) {
+      using stile_t = NAXTile<AccumType, TQ, TK>;
+      using sfrag_t = typename stile_t::frag_type;
+      constexpr short kE = stile_t::kElemsPerFrag;
+      threadgroup sfrag_t pipe_p[4][2][32];
+      threadgroup AccumType pipe_row[4][2][kU];
+      const short sgi = short(simd_group_id);
+      const short lane = short(simd_lane_id);
+      const short2 pc = otile_t::NAXFrag_t::get_coord();
+      const short psm = pc.y;
+      const short psn = pc.x;
+      constexpr short kRows = otile_t::kRowsPerThread;
+      const short lim_q = params->qL_rem;
+      const short lim_k = params->kL_rem;
+      const int nb = params->NK;
+      NAXTile<AccumType, 1, 2> Opair;
+      Opair.clear();
+      metal::vec<AccumType, kRows> m_run;
+      metal::vec<AccumType, kRows> l_run{0};
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kRows; ++i) {
+        m_run[i] = Limits<AccumType>::finite_min;
+      }
+      for (int b0 = 0; b0 < nb; b0 += 4) {
+        const int b = b0 + sgi;
+        const bool mine = b < nb;
+        stile_t Stile;
+        if (mine) {
+          const int is_last_k = (b == (params->NK_aligned));
+          const device T* Kb = K + b * BK * int(params->K_strides[2]);
+          Stile.clear();
+#pragma clang loop unroll_count(4)
+          for (short id = 0; id < TD; id++) {
+            NAXTile<T, 1, 1> Qtile;
+            NAXTile<T, 2, 1> Ktile;
+            const int Q_load_off = id * kU;
+            const int K_load_off = id * kU;
+            if (!align_Q) {
+              Qtile.load_rows(Q + Q_load_off, int(params->Q_strides[2]), lim_q);
+            } else {
+              Qtile.load(Q + Q_load_off, int(params->Q_strides[2]));
+            }
+            if (!align_K && is_last_k) {
+              Ktile.load_rows(
+                  Kb + K_load_off, int(params->K_strides[2]), lim_k);
+            } else {
+              Ktile.load(Kb + K_load_off, int(params->K_strides[2]));
+            }
+            stile_t::NAXFrag_t::mma(
+                Stile.frag_at(0, 0),
+                Stile.frag_at(0, 1),
+                Qtile.frag_at(0, 0),
+                metal::false_type{},
+                Ktile.frag_at(0, 0),
+                Ktile.frag_at(1, 0),
+                metal::true_type{});
+          }
+          STEEL_PRAGMA_UNROLL
+          for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
+            Stile.elems()[ii] *= float(scale2);
+          }
+          if (!align_K && is_last_k) {
+            constexpr auto neg_inf = Limits<AccumType>::finite_min;
+            STEEL_PRAGMA_UNROLL
+            for (short ik = 0; ik < TK; ik++) {
+              const short col_pos = ik * kU + psn;
+              thread auto& fg = Stile.frag_at(0, ik);
+              STEEL_PRAGMA_UNROLL
+              for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+                STEEL_PRAGMA_UNROLL
+                for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
+                  const auto loc = ii * stile_t::kFragThrCols + jj;
+                  fg[loc] =
+                      ((col_pos + jj) < params->kL_rem) ? fg[loc] : neg_inf;
+                }
+              }
+            }
+          }
+          if (has_mask) {
+            constexpr auto neg_inf = Limits<AccumType>::finite_min;
+            const int base_row = 0;
+            const int base_col = b * BK;
+            constexpr bool is_bool = is_same_v<MaskType, bool>;
+            using melem_t =
+                typename metal::conditional_t<is_bool, bool, AccumType>;
+            using mtile_t = NAXTile<melem_t, TQ, TK>;
+            using mfrag_t = typename mtile_t::frag_type;
+            if (base_row + BQ <= params->qL && base_col + BK <= params->kL) {
+              for (short ik = 0; ik < TK; ik++) {
+                const int row_pos = base_row;
+                const int col_pos = base_col + ik * kU;
+                mfrag_t mfrag;
+                mtile_t::NAXFrag_t::load(
+                    mfrag,
+                    mask,
+                    int64_t(mask_params->M_strides[2]),
+                    Int<1>{},
+                    row_pos,
+                    col_pos);
+                thread auto& fg = Stile.frag_at(0, ik);
+                STEEL_PRAGMA_UNROLL
+                for (short jj = 0; jj < mtile_t::kElemsPerFrag; jj++) {
+                  if constexpr (is_bool) {
+                    fg[jj] = mfrag[jj] ? fg[jj] : neg_inf;
+                  } else {
+                    fg[jj] += M_LOG2E_F * AccumType(mfrag[jj]);
+                  }
+                }
+              }
+            } else {
+              STEEL_PRAGMA_UNROLL
+              for (short ik = 0; ik < TK; ik++) {
+                const int row_pos = base_row;
+                const int col_pos = base_col + ik * kU;
+                mfrag_t mfrag;
+                mtile_t::NAXFrag_t::load_safe(
+                    mfrag,
+                    mask,
+                    int64_t(mask_params->M_strides[2]),
+                    Int<1>{},
+                    params->qL,
+                    params->kL,
+                    row_pos,
+                    col_pos);
+                thread auto& fg = Stile.frag_at(0, ik);
+                STEEL_PRAGMA_UNROLL
+                for (short jj = 0; jj < mtile_t::kElemsPerFrag; jj++) {
+                  if constexpr (is_bool) {
+                    fg[jj] = mfrag[jj] ? fg[jj] : neg_inf;
+                  } else {
+                    fg[jj] += M_LOG2E_F * AccumType(mfrag[jj]);
+                  }
+                }
+              }
+            }
+          }
+          // this block's row maxima (from the lowest value, as the loop's
+          // chain)
+          metal::vec<AccumType, kRows> bmax;
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < kRows; ++i) {
+            bmax[i] = Limits<AccumType>::finite_min;
+          }
+          Stile.template row_reduce<MaxOp>(bmax);
+          if (psn == 0) {
+            STEEL_PRAGMA_UNROLL
+            for (short i = 0; i < kRows; ++i) {
+              pipe_row[sgi][0][psm + i * 8] = bmax[i];
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // running maxima over this round's blocks; this simdgroup's block's
+        // pair
+        metal::vec<AccumType, kRows> m_prev_mine = m_run;
+        metal::vec<AccumType, kRows> m_mine = m_run;
+        metal::vec<AccumType, kRows> m_prevs[4];
+        metal::vec<AccumType, kRows> m_news[4];
+        STEEL_PRAGMA_UNROLL
+        for (short s = 0; s < 4; s++) {
+          m_prevs[s] = m_run;
+          if (b0 + s < nb) {
+            STEEL_PRAGMA_UNROLL
+            for (short i = 0; i < kRows; ++i) {
+              m_run[i] = max(m_run[i], pipe_row[s][0][psm + i * 8]);
+            }
+          }
+          m_news[s] = m_run;
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short s = 0; s < 4; s++) {
+          if (s == sgi) {
+            m_prev_mine = m_prevs[s];
+            m_mine = m_news[s];
+          }
+        }
+        if (mine) {
+          // exp2(S - rowmax)
+          Stile.template row_bin_op<ExpSubOp>(m_mine);
+          metal::vec<AccumType, kRows> factor;
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < kRows; ++i) {
+            factor[i] = fast::exp2(m_prev_mine[i] - m_mine[i]);
+          }
+          pipe_p[sgi][0][lane] = Stile.frag_at(0, 0);
+          pipe_p[sgi][1][lane] = Stile.frag_at(0, 1);
+          if (psn == 0) {
+            STEEL_PRAGMA_UNROLL
+            for (short i = 0; i < kRows; ++i) {
+              pipe_row[sgi][1][psm + i * 8] = factor[i];
+            }
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // consume the round's blocks in key order for this simdgroup's O pair
+        const short id = 2 * sgi;
+        for (short s = 0; s < 4; s++) {
+          const int bb = b0 + s;
+          if (bb >= nb) {
+            break;
+          }
+          const int is_last_k = (bb == (params->NK_aligned));
+          metal::vec<AccumType, kRows> factor;
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < kRows; ++i) {
+            factor[i] = pipe_row[s][1][psm + i * 8];
+          }
+          stile_t Ptile;
+          Ptile.frag_at(0, 0) = pipe_p[s][0][lane];
+          Ptile.frag_at(0, 1) = pipe_p[s][1][lane];
+          // Row Sum (the loop's own statements)
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < kRows; ++i) {
+            l_run[i] = l_run[i] * factor[i];
+          }
+          Ptile.template row_reduce<SumOp>(l_run);
+          Opair.template row_bin_op<MulOp>(factor);
+          const device T* Vb = V + bb * BK * int(params->V_strides[2]);
+          STEEL_PRAGMA_UNROLL
+          for (short ik = 0; ik < TK; ik++) {
+            NAXTile<T, 1, 2> Vtile;
+            const int V_load_off =
+                ik * kU * int(params->V_strides[2]) + id * kU;
+            if (!align_K && is_last_k) {
+              Vtile.load_rows(
+                  Vb + V_load_off, int(params->V_strides[2]), lim_k - ik * kU);
+            } else {
+              Vtile.load(Vb + V_load_off, int(params->V_strides[2]));
+            }
+            otile_t::NAXFrag_t::mma(
+                Opair.frag_at(0, 0),
+                Opair.frag_at(0, 1),
+                Ptile.frag_at(0, ik),
+                metal::false_type{},
+                Vtile.frag_at(0, 0),
+                Vtile.frag_at(0, 1),
+                metal::false_type{});
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      metal::vec<AccumType, kRows> rcp;
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kRows; ++i) {
+        rcp[i] = 1.f / l_run[i];
+      }
+      Opair.template row_bin_op<MulOp>(rcp);
+      STEEL_PRAGMA_UNROLL
+      for (short f = 0; f < 2; f++) {
+        otile_t::NAXFrag_t::store_rows(
+            Opair.frag_at(0, f),
+            O,
+            int(params->O_strides[2]),
+            Int<1>{},
+            short(params->qL),
+            Int<0>{},
+            short((2 * sgi + f) * kU));
+      }
+      return;
+    }
+  }
   otile_t Otile;
 
   Otile.clear();
